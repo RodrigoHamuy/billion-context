@@ -79,6 +79,7 @@ import { buildIncomingImageIndex, pruneRetrieveImgExports } from "./image-restor
 import { imageCompressionEnabled, storeEffectiveImageCompression, type ImageCompressionSettings } from "./image-compress.js";
 import { rulesEnabled, storeEffectiveRules } from "./rules-feature.js";
 import { storeEffectiveSearchPlanAware } from "./decompress-shared.js";
+import { disposeAsyncCompress } from "./async-compress.js";
 import { armAutoFoldBackoff, autoFoldEngaged, AUTO_FOLD_BACKOFF_MS, externalQueueDroppedAll, withExternalSummaryTools } from "./external-summary-surface.js";
 import { AUTO_FOLD_TARGET_MIN } from "./external-summary-settings.js";
 import { applyRanges } from "./stream.js";
@@ -365,21 +366,7 @@ export function googlePathKind(urlPath: string): GooglePathKind | null {
     return null;
 }
 
-/** The Gemini request carries the model in the URL path, never in the body
- *  (`POST /v1beta/models/gemini-3.8-flash:streamGenerateContent`). Every
- *  model-keyed decision (window resolution, thresholds, the summarization
- *  adapter, degenerate-turn analysis) reads it from here instead of
- *  `parsed.model`. Returns undefined when the path carries no model or an
- *  undecodable one. */
-export function googleModelFromPath(urlPath: string): string | undefined {
-    const m = /\/models\/([^/:?]+):(?:streamGenerateContent|generateContent|countTokens)\b/.exec(urlPath);
-    if (!m || !m[1]) return undefined;
-    try {
-        return decodeURIComponent(m[1]);
-    } catch {
-        return m[1];
-    }
-}
+export { googleModelFromPath } from "./google-model-path.js";
 
 
 /** #2895: per-server force-close handle attached to every startServer()
@@ -514,6 +501,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         }
     };
     const server = http.createServer(dispatch);
+    server.on("close", () => disposeAsyncCompress("server closed"));
     // Generic WebSocket bridge: protocol codecs claim upgrades here (#1467
     // phase-2 shell); the Responses codec is the first (and currently only)
     // entry. Unclaimed upgrades still fall through to the 426 contract below.
