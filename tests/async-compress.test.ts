@@ -1845,3 +1845,124 @@ test("no kernel offer (Claude bridge shape) + a range limited to visibly tagged 
         await r.close();
     }
 });
+
+test("#2748 net-benefit: a fork summary that passes validation but would grow the context is refused at commit and owes one note", async () => {
+    ac.configureAsyncCompress({});
+    freshStore();
+    const rig = await startRig();
+    const bloated = `${SUMMARY} `.repeat(30);
+    rig.setHandler(defaultHandler(undefined, (refs) => [{ name: "compress", args: { content: [{ startId: refs[1], endId: refs[6], summary: bloated } ] } }]));
+    try {
+        assert.ok(bloated.length < defaultConfig(200_000).compress.maxSummaryLength, "summary stays under the kernel length limit, so only the net-benefit gate can refuse it");
+        const { tag, withResult } = await queueAndCapture(rig, "netgrow", history(16));
+        await waitFor(() => [...ac._asyncCompressStateForTest().jobs.values()][0]?.phase === "ready");
+        const before = structuredClone(sessionFor("netgrow")!.state);
+        const from = rig.seen.length;
+        await chat(rig, "netgrow", [...withResult, { role: "assistant", content: "ok" }, { role: "user", content: "a" }], true, PLUGIN_TOOLS);
+        const session = sessionFor("netgrow")!;
+        assert.equal(session.state.blocks.length, 0, "no block committed");
+        for (const [ref, raw] of Object.entries(before.messageRefs.byRef)) assert.equal(session.state.messageRefs.byRef[ref], raw, `ref ${ref} unchanged`);
+        assert.equal(ac._asyncCompressStateForTest().jobs.size, 0, "job consumed");
+        const why = /did not apply \(([^)]*)\)/.exec(rig.seen[from]!.body)?.[1];
+        assert.equal(why, "discarded: the fold was refused at commit", `the refusal note rides the same request (got ${why ?? "none"})`);
+        assert.ok(!rig.seen[from]!.body.includes(bloated.slice(0, 200)), "the bloated summary never reaches the wire");
+        assert.equal(notesIn(rig, from, tag), 1, "note delivered once");
+        await chat(rig, "netgrow", [...withResult, { role: "assistant", content: "ok" }, { role: "user", content: "a" }, { role: "assistant", content: "ok" }, { role: "user", content: "b" }], true, PLUGIN_TOOLS);
+        await chat(rig, "netgrow", [...withResult, { role: "assistant", content: "ok" }, { role: "user", content: "a" }, { role: "assistant", content: "ok" }, { role: "user", content: "b" }, { role: "assistant", content: "ok" }, { role: "user", content: "c" }], true, PLUGIN_TOOLS);
+        assert.equal(notesIn(rig, from, tag), 1, "and not again");
+    } finally {
+        await closeRig(rig);
+    }
+});
+
+test("proxy-mode reconcile between capture and apply: repair of an earlier block keeps the job valid; churn inside the captured span discards it", async () => {
+    ac.configureAsyncCompress({});
+    try {
+        freshStore();
+        const rig = await startRig();
+        try {
+            const EARLY = "EARLY-BLOCK: user turns 0 to 2 walked through the failing module and the retry loop. ".repeat(3);
+            const refNum = (r: string): number => Number(r.slice(1));
+            let earlyEnd = 0;
+            let sysRef = "";
+            let chosen: { startId: string; endId: string } | undefined;
+            const base = defaultHandler(undefined, (refs) => {
+                const later = refs.filter((r) => r !== sysRef && refNum(r) > earlyEnd);
+                chosen = { startId: later[0]!, endId: later[6]! };
+                return [{ name: "compress", args: { content: [{ ...chosen, summary: SUMMARY }] } }];
+            });
+            rig.setHandler(async (seen, res) => {
+                if (!seen.fork && lastUserText(seen.parsed).includes("FOLD EARLY")) {
+                    const refs = refsOf(seen.body);
+                    sysRef = refs[0]!;
+                    earlyEnd = refNum(refs[6]!);
+                    openaiCalls(res, [{ name: "compress", args: { content: [{ startId: refs[1], endId: refs[6], summary: EARLY }] } }]);
+                    return;
+                }
+                await base(seen, res);
+            });
+            const churn = (m: Record<string, unknown>): Record<string, unknown> => ({ ...m, content: `${String(m.content).replace(": ", ":   ")}\r\n` });
+            // A real earlier proxy fold, then a queued job captured and ready over a later span.
+            const setup = async (sid: string) => {
+                const h = history(20);
+                await chat(rig, sid, [...h, { role: "user", content: "FOLD EARLY" }], false);
+                const session = sessionFor(sid)!;
+                const early = session.state.blocks.find((b) => b.active);
+                assert.ok(early, `${sid}: earlier block committed`);
+                const earlyIds = [...(early!.effectiveMessageIds ?? [])];
+                const h1 = [...h, { role: "user", content: "FOLD EARLY" }, { role: "assistant", content: "ok" }];
+                await chat(rig, sid, [...h1, { role: "user", content: "TRIGGER" }], false);
+                await waitFor(() => [...ac._asyncCompressStateForTest().jobs.values()][0]?.phase === "ready");
+                assert.ok(chosen, `${sid}: the fork chose a span after the earlier block`);
+                return { session, early: early!, earlyIds, h2: [...h1, { role: "user", content: "TRIGGER" }, { role: "assistant", content: "ok" }] };
+            };
+
+            // (a) whitespace churn of messages covered by the earlier block: reconcile repair re-anchors
+            // them onto the churned bytes; block identity is unchanged, so the job still applies.
+            {
+                const { early: early0, earlyIds, h2 } = await setup("recon-a");
+                const churned = h2.map((m, i) => (i === 2 || i === 4 ? churn(m) : m));
+                const from = rig.seen.length;
+                await chat(rig, "recon-a", [...churned, { role: "user", content: "continue" }], false);
+                const session = sessionFor("recon-a")!;
+                const early = session.state.blocks.find((b) => b.blockId === early0.blockId && b.runId === early0.runId);
+                assert.ok(early?.active, "earlier block still active under the same identity");
+                const ids = early!.effectiveMessageIds ?? [];
+                assert.equal(ids.length, earlyIds.length, "no covered message was lost");
+                assert.ok(earlyIds.some((id) => !ids.includes(id)), "a churned original id left the block");
+                assert.ok(ids.some((id) => !earlyIds.includes(id)), "its churned replacement was claimed by the block");
+                const active = session.state.blocks.filter((b) => b.active);
+                assert.equal(active.length, 2, `the job applied on the same request (note=${/did not apply \(([^)]*)\)/.exec(rig.seen[from]!.body)?.[1] ?? "none"})`);
+                assert.ok(active.some((b) => b.compressCallId?.startsWith(ac.ASYNC_COMPRESS_CALL_ID_PREFIX)), "the new block is the async one");
+                assert.equal(ac._asyncCompressStateForTest().jobs.size, 0, "job consumed");
+                const wire = rig.seen[from]!.body;
+                assert.ok(wire.includes(SUMMARY.slice(0, 60)) && wire.includes(EARLY.slice(0, 40)), "both carriers ride the request");
+                assert.ok(!wire.includes("user turn 1:"), "the churned covered message stays folded");
+            }
+
+            // (b) churn inside the captured span: reconcile does not claim uncovered messages, so the
+            // captured view no longer matches and the job is discarded with a note.
+            {
+                chosen = undefined;
+                const { h2 } = await setup("recon-b");
+                const session = sessionFor("recon-b")!;
+                const start = Number(chosen!.startId.slice(1)), end = Number(chosen!.endId.slice(1));
+                const blocks0 = session.state.blocks.filter((b) => b.active).map((b) => b.blockId);
+                const churned = h2.map((m, i) => (i >= 6 && i < 40 && m.role === "user" ? churn(m) : m));
+                const from = rig.seen.length;
+                await chat(rig, "recon-b", [...churned, { role: "user", content: "continue" }], false);
+                assert.ok(end > start);
+                assert.deepEqual(session.state.blocks.filter((b) => b.active).map((b) => b.blockId), blocks0, "no block committed");
+                assert.equal(ac._asyncCompressStateForTest().jobs.size, 0, "job consumed");
+                const why = /did not apply \(([^)]*)\)/.exec(rig.seen[from]!.body)?.[1];
+                assert.match(why ?? "", /^discarded as stale: range m\d+-m\d+ changed in the current view$/, `stale via the current view (got ${why ?? "none"})`);
+                assert.ok(!rig.seen[from]!.body.includes(SUMMARY.slice(0, 60)), "the fork summary never reaches the wire");
+            }
+        } finally {
+            await closeRig(rig);
+        }
+    } finally {
+        ac.configureAsyncCompress(false);
+        ac.disposeAsyncCompress("test end");
+    }
+});

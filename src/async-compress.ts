@@ -25,7 +25,7 @@ import type { WireProtocol } from "./util.js";
 
 export const ASYNC_COMPRESS_CALL_ID_PREFIX = "async_compress_";
 
-export interface AsyncCompressPolicy {
+interface AsyncCompressPolicy {
     captureTimeoutMs: number;
     forkTimeoutMs: number;
     readyTtlMs: number;
@@ -73,7 +73,7 @@ interface Note {
     text: string;
 }
 
-export interface OutboundSend {
+interface OutboundSend {
     url: string;
     headers: Record<string, string>;
     body: string;
@@ -371,12 +371,12 @@ function activeBlockKeys(session: Session): string[] {
     return session.state.blocks.filter((b) => b.active).map((b) => `${b.blockId}:${b.runId}`).sort();
 }
 
-export interface FoldHint {
+interface FoldHint {
     startRef: string;
     endRef: string;
 }
 
-export type FoldSuggestion = { hint: FoldHint; reason?: undefined } | { hint?: undefined; reason: "no-offer" | "stale-offer" | "none-offered" };
+type FoldSuggestion = { hint: FoldHint; reason?: undefined } | { hint?: undefined; reason: "no-offer" | "stale-offer" | "none-offered" };
 
 function sameSpans(a: readonly BlockSpan[], b: readonly BlockSpan[]): boolean {
     if (a.length !== b.length) return false;
@@ -495,7 +495,7 @@ function modelOf(protocol: WireProtocol, body: Record<string, unknown>, url: str
     try { return googleModelFromPath(new URL(url).pathname); } catch { return undefined; }
 }
 
-export interface ForkCall { name: string; arguments: string }
+interface ForkCall { name: string; arguments: string }
 
 function adapterFor(protocol: WireProtocol, body: Record<string, unknown>): CompressLoopAdapter {
     if (protocol === "anthropic") return createAnthropicAdapter(body);
@@ -608,10 +608,10 @@ export function mediaTypeClass(header: string | null): string {
     return KNOWN_MEDIA_TYPES.has(token) ? token : "other";
 }
 
-export type ReplyFraming = "sse" | "json" | "html" | "empty" | "other";
+type ReplyFraming = "sse" | "json" | "html" | "empty" | "other";
 
 /** Classifies a decoded reply by its first non-blank characters (a BOM is already removed by TextDecoder). */
-export function replyFraming(text: string): ReplyFraming {
+function replyFraming(text: string): ReplyFraming {
     const head = text.slice(0, 4096).trimStart();
     if (head.length === 0) return text.trim().length === 0 ? "empty" : "other";
     if (/^(?::|(?:data|event|id|retry)[ \t]*:)/.test(head)) return "sse";
@@ -730,7 +730,7 @@ function staleReason(capture: Capture, session: Session, messages: readonly Core
     return null;
 }
 
-export interface AsyncApplyContext {
+interface AsyncApplyContext {
     core: CompressionCore;
     config: Config;
     protocol: WireProtocol;
