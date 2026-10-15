@@ -96,6 +96,21 @@ test("Responses WS egress headers: azure strips consumed x-bili-* under the cust
     for (const dropped of ["host", "connection", "content-length", "sec-websocket-key"]) assert.ok(!(dropped in openai), `non-azure egress must still drop hop marker ${dropped}`);
 });
 
+// #3073: the codex remote_compaction_v2 beta feature is stripped on EVERY
+// host (not just via buildForwardTarget) so probe and turn egress agree.
+test("Responses WS egress headers: remote_compaction_v2 beta feature stripped on all hosts (#3073)", () => {
+    const base = { "content-type": "application/json", authorization: "Bearer t" };
+    const openai = finalizeResponsesWsUpstreamHeaders("https://api.openai.com/v1/responses", { ...base, "x-codex-beta-features": "remote_compaction_v2, some_other_feature" });
+    assert.equal(openai["x-codex-beta-features"], "some_other_feature");
+    const only = finalizeResponsesWsUpstreamHeaders("https://api.openai.com/v1/responses", { ...base, "x-codex-beta-features": " remote_compaction_v2 , " });
+    assert.ok(!("x-codex-beta-features" in only));
+    const untouched = finalizeResponsesWsUpstreamHeaders("https://api.openai.com/v1/responses", { ...base, "x-codex-beta-features": "some_other_feature" });
+    assert.equal(untouched["x-codex-beta-features"], "some_other_feature");
+    const azure = finalizeResponsesWsUpstreamHeaders("https://westus2.openai.azure.com/openai/v1/responses", { ...base, "x-bili-plugin": "opencode", "x-codex-beta-features": "remote_compaction_v2, some_other_feature" });
+    assert.equal(azure["x-codex-beta-features"], "some_other_feature");
+    assert.ok(!("x-bili-plugin" in azure));
+});
+
 test("V2 handshake: openai/azure and custom OpenAI-compatible responses sockets are intercepted; non-responses endpoints stay direct", async () => {
     const hooks = new Map<string, (event: V2HttpRequestEvent) => void | Promise<void>>();
     const origin = "http://127.0.0.1:8787";

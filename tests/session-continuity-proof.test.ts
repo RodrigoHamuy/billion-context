@@ -149,7 +149,7 @@ async function harness(wire: Wire) {
     };
     return {
         dshChat, pluginTool, snapshot, fork, forwarded, store,
-        close: async () => { store.cancelAll(); proxy.close(); upstream.close(); await Promise.all([once(proxy, "close"), once(upstream, "close")]); },
+        close: async () => { store.cancelAll(); proxy.close(); proxy.closeIdleConnections?.(); upstream.close(); upstream.closeIdleConnections?.(); await Promise.all([once(proxy, "close"), once(upstream, "close")]); },
     };
 }
 

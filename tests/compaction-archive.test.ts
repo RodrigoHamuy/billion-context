@@ -131,14 +131,68 @@ test("compaction archive: decompress on an archived block gives an explicit reas
     assert.match(out, /no longer reachable/);
 });
 
-test("compaction archive: acp_status surfaces the archive instead of listing it as active", () => {
+test("compaction archive: acp_status surfaces the archive aggregated by default, per-block on demand (#3105)", () => {
     const { session, blockId, tail } = sessionWithActiveBlock();
     runShortenedTurn(session, tail, true);
     const ctx: LoopCtx = { core: createCore(), config: defaultConfig(200000), messages: tail, session, log: (_msg: string) => {} };
     const out = executeProxyTool("acp_status", {}, ctx).text;
-    assert.match(out, /PRE-COMPACTION ARCHIVE/);
+    assert.match(out, /PRE-COMPACTION ARCHIVE — 1 block\(s\)/);
     assert.match(out, /decompress is unavailable/);
-    assert.ok(out.includes(blockId), "acp_status names the archived block");
+    assert.doesNotMatch(out, /^\s{2}b\S+ — /m, "default view aggregates by reason — no per-block lines (#3105)");
+    assert.match(out, /1: content replaced by client native compaction summary/);
+    assert.match(out, /acp_status\(\{ archiveDetail: true \}\)/, "default view points at the on-demand detail call");
+    const detail = executeProxyTool("acp_status", { archiveDetail: true }, ctx).text;
+    const perBlock = detail.match(/^\s{2}(b\S+) — .+$/gm) ?? [];
+    assert.ok(perBlock.some((line) => line.trim().startsWith(`${blockId} —`)), `detail mode names the archived block (${blockId}) with its reason`);
+});
+
+// #3105 fixtures: archives seeded directly on the metadata (the render path
+// under test reads preCompactionArchiveOf, which trusts that record).
+function sessionWithArchive(entries: Record<string, { at: number; reason: string }>): Session {
+    const session = makeSession();
+    session.metadata.preCompactionArchive = entries;
+    return session;
+}
+
+function archiveCtx(session: Session): LoopCtx {
+    return { core: createCore(), config: defaultConfig(200000), messages: [], session, log: (_msg: string) => {} };
+}
+
+test("compaction archive: hundreds of same-reason blocks aggregate to a constant-size section (#3105)", () => {
+    const reason = "covered substrate destroyed by unannounced client history rewrite (#2695)";
+    const entries: Record<string, { at: number; reason: string }> = {};
+    for (let i = 1; i <= 300; i++) entries[`b${i}`] = { at: i, reason };
+    const out = executeProxyTool("acp_status", {}, archiveCtx(sessionWithArchive(entries))).text;
+    assert.match(out, /PRE-COMPACTION ARCHIVE — 300 block\(s\)/);
+    assert.equal((out.match(/unannounced client history rewrite/g) ?? []).length, 1, "reason stated once, not once per block");
+    assert.match(out, /300: covered substrate destroyed by unannounced client history rewrite \(#2695\)/);
+    assert.doesNotMatch(out, /^\s{2}b\d+ — /m, "no per-block lines in the default view");
+    const section = out.split("PRE-COMPACTION ARCHIVE — ")[1]!.split("\n\n")[0]!;
+    assert.equal(section.split("\n").length, 3, `section is header + reason-count + hint only, constant size for 300 blocks (got ${section.length} chars)`);
+});
+
+test("compaction archive: distinct reasons keep separate accurate counts (#3105)", () => {
+    const entries: Record<string, { at: number; reason: string }> = {
+        b1: { at: 1, reason: "content replaced by client native compaction summary" },
+        b2: { at: 2, reason: "content replaced by client native compaction summary" },
+        b3: { at: 3, reason: "content replaced by client native compaction summary" },
+        b4: { at: 4, reason: "covered substrate destroyed by unannounced client history rewrite (#2695)" },
+        b5: { at: 5, reason: "covered substrate destroyed by unannounced client history rewrite (#2695)" },
+    };
+    const out = executeProxyTool("acp_status", {}, archiveCtx(sessionWithArchive(entries))).text;
+    assert.match(out, /PRE-COMPACTION ARCHIVE — 5 block\(s\)/);
+    assert.match(out, /3: content replaced by client native compaction summary/);
+    assert.match(out, /2: covered substrate destroyed by unannounced client history rewrite \(#2695\)/);
+});
+
+test("compaction archive: archiveDetail lists per-block ids capped at 50 with an omitted count (#3105)", () => {
+    const reason = "covered substrate destroyed by unannounced client history rewrite (#2695)";
+    const entries: Record<string, { at: number; reason: string }> = {};
+    for (let i = 1; i <= 60; i++) entries[`b${i}`] = { at: i, reason };
+    const detail = executeProxyTool("acp_status", { archiveDetail: true }, archiveCtx(sessionWithArchive(entries))).text;
+    assert.match(detail, /PRE-COMPACTION ARCHIVE — 60 block\(s\)/);
+    assert.equal(detail.match(/^\s{2}b\d+ — /gm)?.length, 50, "per-block listing capped at 50");
+    assert.match(detail, /\(\+10 more; showing first 50 of 60\)/, "omitted count made explicit");
 });
 
 test("zombie reap (#2695): decompress on a reaped block names the reap reason, not \"not found\"", () => {

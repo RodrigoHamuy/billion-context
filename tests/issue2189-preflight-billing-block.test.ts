@@ -219,8 +219,10 @@ test("#2189 anthropic summary carries the client billing-attribution block at sy
         assert.ok(lastForward?.body.includes(BILLING_TEXT), "the MAIN forward still carries the client attribution block (main lane untouched)");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });
@@ -251,8 +253,10 @@ test("#2189 legacy string system keeps the byte-identical summary shape", async 
         }
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });
@@ -293,8 +297,10 @@ test("#2189 bare-Error 429 fails fast after ONE attempt, retryable=false, arms t
     } finally {
         setLogCapture(null);
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });
@@ -325,8 +331,10 @@ test("#2189 a genuine rate limit keeps the legacy 3-attempt replay and retryable
     } finally {
         setLogCapture(null);
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });

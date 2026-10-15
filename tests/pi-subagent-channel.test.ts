@@ -317,8 +317,10 @@ test("#2268 server-level: tagged ACP-less delegate child gets proxy-style inject
         for (const n of CORE_ACP) assert.ok(!e.includes(n), `history-quoted marker must stay plugin mode (${n})`);
     } finally {
         rig.proxy.close();
+        rig.proxy.closeIdleConnections?.();
         await once(rig.proxy, "close");
         rig.upstream.close();
+        rig.upstream.closeIdleConnections?.();
         await once(rig.upstream, "close");
     }
 });

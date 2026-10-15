@@ -59,16 +59,29 @@ async function startBare(opts: Partial<ProxyOptions>, captured: Captured[]): Pro
 test("banner carries pid + instance id and fires exactly once per listen", async () => {
     const captured: Captured[] = [];
     let dir: string | undefined;
+    let proxy: http.Server | undefined;
     try {
-        const { proxy, dir: d } = await startBare({}, captured);
-        dir = d;
+        const started = await startBare({}, captured);
+        proxy = started.proxy;
+        dir = started.dir;
         const port = (proxy.address() as { port: number }).port;
+        // #2941: registration now completes AFTER the bind (post-bind ownership
+        // check), so "listening" no longer implies the banner is logged yet — poll for it.
+        const t0 = Date.now();
+        while (!captured.some((c) => c.msg.includes("listening on")) && Date.now() - t0 < 10_000) {
+            await new Promise((r) => setTimeout(r, 25));
+        }
         const banners = captured.filter((c) => c.msg.includes("listening on"));
         assert.equal(banners.length, 1, "one banner per successful listen");
         assert.match(banners[0]!.msg, new RegExp(`^acp-proxy v[\\d.]+ \\(pid ${process.pid}, id [0-9a-f]{8}\\) listening on http://127\\.0\\.0\\.1:${port}`));
         assert.ok(banners[0]!.msg.includes("web UI:"), "rest of the banner line is unchanged");
-        await new Promise<void>((resolve, reject) => proxy.close((e) => (e ? reject(e) : resolve())));
     } finally {
+        // best-effort close on EVERY path — an assertion failure above must not
+        // leak the server handle (it would pin this process's event loop forever).
+        if (proxy !== undefined) {
+            const p = proxy;
+            await new Promise<void>((resolve) => p.close(() => resolve()));
+        }
         setLogCapture(null);
         closeLogger();
         if (dir) rmrf(dir);

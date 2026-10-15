@@ -12,8 +12,9 @@ import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createHash } from "node:crypto";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
-import { getSession, _resetSessionsForTest } from "../src/session.ts";
+import { getSession, peekSession, _resetSessionsForTest } from "../src/session.ts";
 import { rmrf } from "./tmp-rm.ts";
 
 // #388: side requests (title-gen / small utility calls) share the main session
@@ -454,8 +455,10 @@ mitm: { enabled: false, domains: [] },
 
 async function closeRig(rig: Rig): Promise<void> {
     rig.proxy.close();
+    rig.proxy.closeIdleConnections?.();
     await once(rig.proxy, "close");
     rig.upstream.close();
+    rig.upstream.closeIdleConnections?.();
     await once(rig.upstream, "close");
 }
 
@@ -913,5 +916,82 @@ test("e2e: the overflow arm survives a restart round-trip; usage after reload re
         store.cancelAll();
         store2?.cancelAll();
         rmrf(dir);
+    }
+});
+
+// #2730: the google lane honors the SAME side-request exclusion as the other
+// wires — a dsh title-gen on the gemini wire (tiny generationConfig.maxOutputTokens)
+// must ride the #388 verbatim passthrough (raw conversation key, no kernel state,
+// no persona fork) instead of being treated as a main turn or forked onto |sub:<fp>.
+test("e2e: google-lane dsh side request resolves verbatim — no kernel state, no persona fork (#2730)", async () => {
+    const upstream = http.createServer((req, res) => {
+        req.resume();
+        req.on("end", () => {
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({ candidates: [{ content: { role: "model", parts: [{ text: "ok" }] }, finishReason: "STOP" }], modelVersion: "gemini-test", usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 3, totalTokenCount: 13 } }));
+        });
+    });
+    upstream.listen(0, "127.0.0.1");
+    await once(upstream, "listening");
+    const upstreamPort = (upstream.address() as { port: number }).port;
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    setRegistryForTest({});
+    _resetSessionsForTest();
+    const proxy = await startServer({
+        port: 0,
+        host: "127.0.0.1",
+        upstream: "http://127.0.0.1",
+        routes: { [`http://127.0.0.1:${upstreamPort}`]: {} },
+        modelContextLimit: 200_000,
+        kernelConfig: defaultConfig(200_000),
+        compress: { injectTool: true, injectNudge: false },
+        promptCache: { routing: "auto" },
+        sessionHeader: "x-acp-session",
+        log: false,
+        debug: false,
+        passthrough: false,
+        autoUpdate: false,
+        autoRestartOnUpdate: false,
+        advisoryCheck: false,
+        releaseNotesCheck: false,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        passthroughSource: null,
+        updateTag: "latest",
+        mitm: { enabled: false, domains: [] },
+    } as ProxyOptions);
+    await once(proxy, "listening");
+    const proxyPort = (proxy.address() as { port: number }).port;
+    const CONV = "dsh-side-google";
+    const SIDE_SYSTEM = "You are a title generator. Write one short title for the conversation.";
+    const url = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1beta/models/gemini-test:generateContent`;
+    const headers: Record<string, string> = { "content-type": "application/json", "x-bili-plugin": "dsh", "x-bili-plugin-conversation": CONV };
+    const fork = `${CONV}|sub:${createHash("sha256").update(SIDE_SYSTEM, "utf8").digest("hex").slice(0, 16)}`;
+    try {
+        // A dsh title-gen on the gemini wire: tiny output budget → a side request
+        // by the token-budget heuristic (generationConfig.maxOutputTokens <= 200).
+        const r1 = await fetch(url, { method: "POST", headers, body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: "Summarize this conversation in one short title." }] }], systemInstruction: { parts: [{ text: SIDE_SYSTEM }] }, generationConfig: { maxOutputTokens: 100 } }) });
+        assert.equal(r1.status, 200);
+        await r1.text();
+        const s = peekSession(CONV);
+        assert.ok(s, "the side request resolved onto the RAW conversation key");
+        assert.equal(Object.keys(s.state.messageRefs.byRaw).length, 0, "side passthrough touches no kernel state");
+        assert.equal(s.stats.requests, 0, "side passthrough counts no requests");
+        assert.equal(peekSession(fork), undefined, "no junk |sub:<fp(side)> forked session on the google lane");
+
+        // A later MAIN turn keeps the raw key (the side request never stole the anchor).
+        const mainContents = Array.from({ length: 4 }, (_, i): { role: string; parts: { text: string }[] } => ({ role: i % 2 === 0 ? "user" : "model", parts: [{ text: `main-${i + 1}-` + "z".repeat(2000) }] }));
+        const r2 = await fetch(url, { method: "POST", headers, body: JSON.stringify({ contents: mainContents, systemInstruction: { parts: [{ text: "You are DeepSeek Harness, the main coding agent.\nWorkspace: /tmp." }] }, generationConfig: { maxOutputTokens: 64_000 } }) });
+        assert.equal(r2.status, 200);
+        await r2.text();
+        assert.ok(Object.keys(peekSession(CONV)!.state.messageRefs.byRaw).length >= 4, "main turn assigned refs under the bare id (anchor not stolen by the earlier side request)");
+        assert.equal(peekSession(fork), undefined, "still no forked session after the main turn");
+    } finally {
+        proxy.close();
+        proxy.closeIdleConnections?.();
+        await once(proxy, "close");
+        upstream.close();
+        upstream.closeIdleConnections?.();
+        await once(upstream, "close");
     }
 });

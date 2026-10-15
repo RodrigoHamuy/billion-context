@@ -57,6 +57,26 @@ export function connectionNamedHeaders(conn: string | string[] | undefined): Set
     return out;
 }
 
+/** Codex advertises its own server-side context compaction via this beta
+ *  feature. It conflicts with bili's client-side compress (bili IS the
+ *  compression layer) and third-party aggregators reject it with
+ *  "invalid range / ref not found". Strip it so bili's compress is the sole
+ *  mechanism. Used by BOTH outbound derivations — the HTTP forward path
+ *  (buildForwardTarget) and the WS lane's final egress
+ *  (finalizeResponsesWsUpstreamHeaders, #3073) — so every outbound Responses
+ *  request carries the same surface regardless of which internal code path
+ *  produced it. */
+export function stripRemoteCompactionBetaFeature(headers: Record<string, string>): void {
+    const betaKey = Object.keys(headers).find((h) => h.toLowerCase() === "x-codex-beta-features");
+    if (!betaKey) return;
+    const kept = headers[betaKey]
+        .split(",")
+        .map((s) => s.trim())
+        .filter((f) => f && f !== "remote_compaction_v2");
+    if (kept.length > 0) headers[betaKey] = kept.join(",");
+    else delete headers[betaKey];
+}
+
 export function buildForwardHeaders(headers: Record<string, string>): Record<string, string> {
     const out: Record<string, string> = {};
     for (const [k, v] of Object.entries(headers)) {

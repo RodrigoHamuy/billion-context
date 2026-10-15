@@ -149,8 +149,10 @@ test("e2e #301: overflow + summary upstream 429 → structured 503, over-window 
         assert.ok(calls.filter((c) => !c.stream).length >= 1, "preflight attempted the (429'd) summarization call");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });
@@ -215,8 +217,10 @@ test("e2e #301: payload fits the window + preflight 429 → request still forwar
         assert.equal(calls.filter((c) => c.stream).length, 2, "both requests were forwarded upstream");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });
@@ -262,8 +266,10 @@ test("e2e #301: over-window payload with nothing compressible → structured 502
         assert.equal(calls.filter((c) => c.stream).length, 0, "the over-window payload was NOT forwarded upstream");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });
@@ -311,8 +317,10 @@ test("e2e #330: over-window payload whose only foldable content is in the protec
         assert.equal(calls.filter((c) => c.stream).length, 1, "the folded payload was forwarded upstream");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });
@@ -358,8 +366,10 @@ test("e2e #470: system + tools overhead counts in the preflight trigger — text
         assert.ok(!forwarded.includes("A".repeat(100)), "the folded big message did NOT ride the forwarded payload");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });
@@ -427,11 +437,14 @@ test("e2e #736: operator-shrunk window (compress.modelContextLimit below the mod
         const msg2 = (JSON.parse(await r2.text()) as { error?: { message?: string } }).error?.message ?? "";
         assert.ok(!msg2.includes("full window"), `no shrink note when the window was not operator-shrunk (got: ${msg2})`);
         proxyPlain.close();
+        proxyPlain.closeIdleConnections?.();
         await once(proxyPlain, "close");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });
@@ -491,8 +504,10 @@ test("e2e #737: output-headroom-shrunk window (non-Anthropic, no operator overri
         assert.equal(calls.length, 0, "no upstream call was spent on an incompressible payload");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });

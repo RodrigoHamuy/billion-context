@@ -22,6 +22,13 @@
 //       an EXACT byte-prefix of the next (mid-history never mutates); the
 //       volatile tail slots (chain checkpoint / nudge / imgNote / retrieval
 //       note, ≤ 4) may only appear as a contiguous tail run;
+//       #3159 (google lane only): Vertex rejects plain text after a
+//       functionResponse part inside one user content, so coreToGoogle
+//       forwards such a content with the plain-text parts LEADING — when a
+//       user content ending on tool results gains new text parts between
+//       turns, the previous body's trailing tool units shift right past the
+//       inserted text run (assertPrefix's allowCanonShift sanctions exactly
+//       that move); every other byte stays an exact prefix;
 //   P2 fold transitions (client re-sends its compress pair after a
 //       /__bili/plugin/tool fold):
 //        P2a the pre-fold span is replaced by exactly the expected carrier
@@ -290,11 +297,26 @@ function canonEq(a: Unit[], b: Unit[], label: string): void {
     }
 }
 
-function assertPrefix(prev: Unit[], next: Unit[], label: string, expectNew: string[]): void {
-    for (let i = 0; i < prev.length; i++) {
-        assert.ok(eqUnit(prev[i]!, next[i]!), `${label}: mid-history unit[${i}] mutated\n previous=${JSON.stringify(prev[i])}\n next    =${JSON.stringify(next[i])}`);
+// #3159 (google lane only): a user content ending on functionResponse parts
+// is forwarded with new plain-text parts LEADING, so between turns the
+// previous body's trailing tool units shift right past an inserted run of
+// text units from that same content. allowCanonShift sanctions exactly that
+// move — text-unit insertions immediately before a surviving byte-equal tool
+// unit — and nothing else; any other mutation still fails.
+function assertPrefix(prev: Unit[], next: Unit[], label: string, expectNew: string[], allowCanonShift = false): void {
+    let pi = 0;
+    let ni = 0;
+    while (pi < prev.length) {
+        if (ni < next.length && eqUnit(prev[pi]!, next[ni]!)) { pi++; ni++; continue; }
+        const p = prev[pi]!;
+        const n = ni < next.length ? next[ni]! : null;
+        assert.ok(allowCanonShift && p.k !== "text" && n !== null && n.k === "text", `${label}: mid-history unit[${pi}] mutated\n previous=${JSON.stringify(p)}\n next    =${JSON.stringify(n)}`);
+        let k = 0;
+        while (ni + k < next.length && next[ni + k]!.k === "text") k++;
+        assert.ok(k > 0 && ni + k < next.length && eqUnit(p, next[ni + k]!), `${label}: unit[${pi}] not realigned after ${k} inserted text unit(s)\n previous=${JSON.stringify(p)}\n next    =${JSON.stringify(next.slice(ni, ni + k + 1))}`);
+        ni += k;
     }
-    const added = next.slice(prev.length);
+    const added = next.slice(ni);
     assert.deepEqual(added.map(keyOf), expectNew, `${label}: appended units ${JSON.stringify(added.map(keyOf))} != expected ${JSON.stringify(expectNew)}`);
 }
 
@@ -542,8 +564,10 @@ async function driveWire(wire: Wire, steps: Step[], opts?: DriveOpts): Promise<C
         }
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
         if (prevXdg === undefined) delete process.env.XDG_STATE_HOME;
         else process.env.XDG_STATE_HOME = prevXdg;
@@ -590,9 +614,9 @@ for (const wire of ["anthropic", "openai", "responses", "google"] as Wire[]) {
         assertPrefix(cans[0]!.core, cans[1]!.core, L(1), ["q3", "a3"]);
         assertPrefix(cans[1]!.core, cans[2]!.core, L(2), ["q4", "a4"]);
         assertFoldTransition(cans[2]!.core, cans[3]!.core, ["q1", "a1"], ["q1"], L(3)); // head boundary survives; anchor stripped (#1567)
-        assertPrefix(cans[3]!.core, cans[4]!.core, L(4), ["q5", "a5"]);
+        assertPrefix(cans[3]!.core, cans[4]!.core, L(4), wire === "google" ? ["a5"] : ["q5", "a5"], wire === "google"); // google: #3159 — q5 leads the fold-pair result
         assertFoldTransition(cans[4]!.core, cans[5]!.core, ["q2", "a2", "q3"], [], L(5)); // anchor stripped (#1567)
-        assertPrefix(cans[5]!.core, cans[6]!.core, L(6), ["q7", "a7"]);
+        assertPrefix(cans[5]!.core, cans[6]!.core, L(6), wire === "google" ? ["a7"] : ["q7", "a7"], wire === "google"); // google: #3159 — q7 leads the fold-pair result
         assertPrefix(cans[6]!.core, cans[7]!.core, L(7), ["q8", "a8"]);
 
         for (let i = 3; i < cans.length; i++) {

@@ -70,7 +70,9 @@ mitm: { enabled: false, domains: [] },
         captured,
         close: async () => {
             proxy.close();
+            proxy.closeIdleConnections?.();
             upstream.close();
+            upstream.closeIdleConnections?.();
             await Promise.allSettled([once(proxy, "close"), once(upstream, "close")]);
         },
     };

@@ -9,6 +9,7 @@ type SymlinkKind = "dir" | "file" | "junction";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
+import { createRequire } from "node:module";
 import {
     claimStartingMarker,
     readStartingMarker,
@@ -1246,6 +1247,11 @@ test("ensureProxyRunning: attaches a late-publishing instance after the spawned 
             registerWatcher: async (origin, pid) => { registrations.push([origin, pid]); return "refused"; },
             attachDiag: () => {},
             scriptPath: FP_SCRIPT,
+            // #2877: this scenario is a lane-less (manual) daemon being ridden by a
+            // LANEd launch — the pre-#2877 cross-zone fallback. Pin it to the
+            // legacy policy so it keeps exercising the post-exit re-discovery
+            // mechanism (its actual subject) rather than the new own-lane default.
+            resolveAttachPolicy: () => "global-fallback",
         },
     );
     assert.equal(handle.attached, true, "attached to the late publisher instead of failing");
@@ -1468,7 +1474,38 @@ test("ensureProxyRunning: unarmed LANE'D listener is not attached by default —
     assert.equal(registered, 0, "no watcher registration is attempted against the refused daemon");
 });
 
-test("ensureProxyRunning: unarmed USER-ZONE daemon (manual `bili start`) is attached by default (#1660)", async () => {
+// #2877 flipped the default: an unarmed USER-ZONE daemon (manual `bili start`,
+// no lane) is no longer ridden by a LANEd launch — every agent converging on one
+// manual proxy was the bug (#2877). The hook now spawns its own session proxy.
+test("ensureProxyRunning: unarmed USER-ZONE daemon (manual `bili start`) is NOT ridden by default — spawns its own (#2877)", async () => {
+    let spawnCalls = 0;
+    let childToken = "";
+    let spawned = false;
+    const handle = await ensureProxyRunning(
+        { host: "127.0.0.1", port: 8787, passthrough: false, debug: false, lane: "pi" },
+        {
+            spawnImpl: (_cmd, _args, options) => {
+                spawned = true;
+                childToken = options.env?.BILI_LAUNCH_TOKEN ?? "";
+                spawnCalls++;
+                return makeFakeChild(42505);
+            },
+            fetchImpl: async () => ({ ok: true }),
+            fetchHealthInfo: async () => ({ ok: true, instanceId: "manual-1", watchdog: { armed: false } }),
+            readInstanceFile: () => (spawned ? recordedInstance({ launchToken: childToken }) : recordedInstance({ instanceId: "manual-1" })),
+            registerWatcher: async () => "ok",
+            sleep: () => new Promise((r) => setTimeout(r, 0)),
+            scriptPath: FP_SCRIPT,
+        },
+    );
+    assert.equal(spawnCalls, 1, "the manual user-zone daemon is no longer ridden by default (#2877)");
+    assert.ok(handle.child);
+    assert.equal(handle.attached, undefined);
+});
+
+// The pre-#2877 behavior (ride the user-maintained daemon) is preserved behind
+// the explicit legacy policy (#1660).
+test("ensureProxyRunning: unarmed USER-ZONE daemon (manual `bili start`) is attached when attachPolicy=global-fallback (#1660/#2877)", async () => {
     let spawnCalls = 0;
     let registered = 0;
     const handle = await ensureProxyRunning(
@@ -1476,7 +1513,7 @@ test("ensureProxyRunning: unarmed USER-ZONE daemon (manual `bili start`) is atta
         {
             spawnImpl: () => {
                 spawnCalls++;
-                return makeFakeChild(42505);
+                return makeFakeChild(42506);
             },
             fetchImpl: async () => ({ ok: true }),
             fetchHealthInfo: async () => ({ ok: true, instanceId: "manual-1", watchdog: { armed: false } }),
@@ -1487,6 +1524,7 @@ test("ensureProxyRunning: unarmed USER-ZONE daemon (manual `bili start`) is atta
             },
             sleep: () => new Promise((r) => setTimeout(r, 0)),
             scriptPath: FP_SCRIPT,
+            resolveAttachPolicy: () => "global-fallback",
         },
     );
     assert.equal(spawnCalls, 0, "the user-maintained daemon is reused, not doubled");
@@ -2066,7 +2104,82 @@ test("runLaunch: explicit ACP_PORT still attaches to a compatible proxy already 
     }
 });
 
-test("runLaunch: omitted ACP_PORT keeps the legacy selection (still attaches a user-zone daemon on any port) (#2177)", async () => {
+// #2877: pickAttachable discovery policy. Default "own-lane" rides only a
+// same-lane daemon and never falls back to a lane-less / user-zone one;
+// "global-fallback" restores the pre-#2877 fallback; an explicit attachUrl
+// targets one origin regardless of policy.
+test("findLiveAttachableInstance: own-lane (default) does NOT fall back to a lane-less user-zone daemon (#2877)", async () => {
+    const inst = await findLiveAttachableInstance(
+        { host: "127.0.0.1", port: 0, passthrough: false, debug: false, lane: "pi" },
+        {
+            fetchHealthInfo: async () => ({ ok: true, watchdog: { armed: false } }),
+            readInstanceFile: () => recordedInstance({ origin: "http://127.0.0.1:8787", port: 8787 }),
+            resolveAttachPolicy: () => "own-lane",
+            scriptPath: FP_SCRIPT,
+        },
+    );
+    assert.equal(inst, undefined, "lane-less user-zone daemon is not a same-lane match → no fallback");
+});
+
+test("findLiveAttachableInstance: global-fallback DOES ride a lane-less user-zone daemon (#2877)", async () => {
+    const inst = await findLiveAttachableInstance(
+        { host: "127.0.0.1", port: 0, passthrough: false, debug: false, lane: "pi" },
+        {
+            fetchHealthInfo: async () => ({ ok: true, watchdog: { armed: false } }),
+            readInstanceFile: () => recordedInstance({ origin: "http://127.0.0.1:8787", port: 8787 }),
+            resolveAttachPolicy: () => "global-fallback",
+            scriptPath: FP_SCRIPT,
+        },
+    );
+    assert.ok(inst, "global-fallback restores the pre-#2877 ride");
+    assert.equal(inst?.origin, "http://127.0.0.1:8787");
+});
+
+test("findLiveAttachableInstance: same-lane daemon still attaches under default own-lane (#2877)", async () => {
+    const inst = await findLiveAttachableInstance(
+        { host: "127.0.0.1", port: 0, passthrough: false, debug: false, lane: "pi" },
+        {
+            fetchHealthInfo: async () => ({ ok: true, watchdog: { armed: true } }),
+            readInstanceFile: () => recordedInstance({ origin: "http://127.0.0.1:18788", port: 18788, lane: "pi" }),
+            resolveAttachPolicy: () => "own-lane",
+            scriptPath: FP_SCRIPT,
+        },
+    );
+    assert.ok(inst, "a same-lane armed daemon is always rideable");
+    assert.equal(inst?.origin, "http://127.0.0.1:18788");
+});
+
+test("findLiveAttachableInstance: explicit attachUrl targets one daemon despite own-lane (#2877)", async () => {
+    const inst = await findLiveAttachableInstance(
+        { host: "127.0.0.1", port: 0, passthrough: false, debug: false, lane: "pi" },
+        {
+            fetchHealthInfo: async () => ({ ok: true, watchdog: { armed: false } }),
+            readInstanceFile: () => recordedInstance({ origin: "http://127.0.0.1:8787", port: 8787 }),
+            resolveAttachPolicy: () => "own-lane",
+            // trailing slash exercises normalizeOrigin
+            resolveAttachUrl: () => "http://127.0.0.1:8787/",
+            scriptPath: FP_SCRIPT,
+        },
+    );
+    assert.ok(inst, "explicit target bypasses the policy filter");
+    assert.equal(inst?.origin, "http://127.0.0.1:8787");
+});
+
+test("findLiveAttachableInstance: attachUrl pointing elsewhere leaves no candidate (#2877)", async () => {
+    const inst = await findLiveAttachableInstance(
+        { host: "127.0.0.1", port: 0, passthrough: false, debug: false, lane: "pi" },
+        {
+            fetchHealthInfo: async () => ({ ok: true, watchdog: { armed: false } }),
+            readInstanceFile: () => recordedInstance({ origin: "http://127.0.0.1:8787", port: 8787 }),
+            resolveAttachPolicy: () => "own-lane",
+            resolveAttachUrl: () => "http://127.0.0.1:9999",
+            scriptPath: FP_SCRIPT,
+        },
+    );
+    assert.equal(inst, undefined, "target mismatch → nothing to attach to");
+});
+
+test("runLaunch: omitted ACP_PORT rides a lane-less user-zone daemon only when attachPolicy=global-fallback (#2877)", async () => {
     const env = piLaunchEnv();
     const st = isoStateDir();
     const ex = stubProcessExit();
@@ -2088,6 +2201,7 @@ test("runLaunch: omitted ACP_PORT keeps the legacy selection (still attaches a u
                 spawnImpl,
                 sleep: () => Promise.resolve(),
                 scriptPath: FP_SCRIPT,
+                resolveAttachPolicy: () => "global-fallback",
             },
         );
         assert.equal(spawnCalls, 0, "no explicit port → free to attach to the user-zone daemon (pre-existing behavior)");
@@ -3722,7 +3836,7 @@ test("writeDshClientShimFiles + dshPluginEntry: resolvable shim yields the bare 
         assert.equal(writeDshClientShimFiles(shimDir, hostBundle, clientBundle, "0.1.169"), true);
         const shimPkg = JSON.parse(fs.readFileSync(path.join(shimDir, "package.json"), "utf8"));
         assert.equal(shimPkg.name, "billion-context");
-        assert.deepEqual(shimPkg.exports, { ".": "./index.js", "./dsh": "./index.js", "./dsh/package.json": "./package.json", "./client": "./bundle.js" });
+        assert.deepEqual(shimPkg.exports, { ".": "./index.js", "./dsh": "./index.js", "./package.json": "./package.json", "./dsh/package.json": "./package.json", "./client": "./bundle.js" });
         assert.equal(shimPkg.dsh.client.platform, "web");
         // The bundles are SYMLINKS into bili's live dist — an auto-update that
         // moves dist self-heals on the next launch without rewriting the shim.
@@ -3732,6 +3846,14 @@ test("writeDshClientShimFiles + dshPluginEntry: resolvable shim yields the bare 
         // Resolvable from the home's walk-up chain, and the root import
         // lands on the host module itself ⇒ the bare entry.
         assert.equal(dshPluginEntry(home), "billion-context");
+
+        // #3043: dsh's client scanner locates the package root via
+        // require.resolve("billion-context/package.json") before reading dsh.client.
+        // Node's closed `exports` map throws ERR_PACKAGE_PATH_NOT_EXPORTED for any
+        // unlisted subpath — omit "./package.json" here (as in the published pkg)
+        // and the scanner swallows the throw, so the browser half never registers.
+        const shimRequire = createRequire(path.join(home, "probe.cjs"));
+        assert.equal(shimRequire.resolve("billion-context/package.json"), path.join(shimDir, "package.json"));
 
         // A shim whose root "." export points elsewhere (e.g. a real install
         // whose root is the CLI entry, not the dsh host half) must NOT claim
@@ -7083,6 +7205,136 @@ test("attach diagnostics record a lifecycle-gate refusal (#1623)", async () => {
     );
     assert.equal(inst, undefined);
     assert.ok(diag.some((m) => m.includes("refusing to attach")), `diag was: ${JSON.stringify(diag)}`);
+});
+
+// #3200: normal candidate filtering is NOT user-actionable — it must land in
+// the durable log file only, never on the interactive terminal. Host
+// processes (pi/omp/… native lanes) never call configureLogger, so the old
+// teeLog default was terminal-only with NO file record at all. Explicit
+// debug adds exactly one controlled stderr copy for CLI contexts.
+test("default attach diagnostics go to the log file, never the terminal (#3200)", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-3200-"));
+    const prevHome = process.env.HOME;
+    const prevUserProfile = process.env.USERPROFILE;
+    const prevXdgConfig = process.env.XDG_CONFIG_HOME;
+    const prevXdgData = process.env.XDG_DATA_HOME;
+    const prevXdgState = process.env.XDG_STATE_HOME;
+    process.env.HOME = home;
+    if (prevUserProfile !== undefined) process.env.USERPROFILE = home;
+    process.env.XDG_CONFIG_HOME = path.join(home, ".config");
+    process.env.XDG_DATA_HOME = path.join(home, ".local", "share");
+    process.env.XDG_STATE_HOME = path.join(home, ".local", "state");
+    const stderrWrites: string[] = [];
+    const origStderrWrite = process.stderr.write.bind(process.stderr);
+    process.stderr.write = ((chunk: unknown) => {
+        stderrWrites.push(String(chunk));
+        return true;
+    }) as typeof process.stderr.write;
+    try {
+        const inst = await findLiveAttachableInstance(
+            { host: "127.0.0.1", port: 0, passthrough: false, debug: false },
+            {
+                fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-1", watchdog: { armed: true } }),
+                readInstanceFile: () => recordedInstance({ codeFingerprint: "deadbeef" }),
+                scriptPath: FP_SCRIPT,
+            },
+        );
+        assert.equal(inst, undefined, "incompatible candidate stays skipped");
+        assert.equal(stderrWrites.length, 0, `terminal got bytes: ${JSON.stringify(stderrWrites)}`);
+        const logFile = path.join(process.env.XDG_STATE_HOME!, "billion-context", "bili.log");
+        const content = fs.readFileSync(logFile, "utf8");
+        assert.ok(content.includes("native-attach: skip"), `log was: ${content}`);
+        assert.ok(content.includes("code-fingerprint-mismatch"), `log was: ${content}`);
+
+        // explicit debug: one controlled stderr copy, same head format as the
+        // legacy teeLog line, file record still written
+        const dbg = await findLiveAttachableInstance(
+            { host: "127.0.0.1", port: 0, passthrough: false, debug: true },
+            {
+                fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-1", watchdog: { armed: true } }),
+                readInstanceFile: () => recordedInstance({ codeFingerprint: "deadbeef" }),
+                scriptPath: FP_SCRIPT,
+            },
+        );
+        assert.equal(dbg, undefined);
+        assert.equal(stderrWrites.length, 1, `debug stderr was: ${JSON.stringify(stderrWrites)}`);
+        assert.ok(stderrWrites[0]!.includes("code-fingerprint-mismatch"), stderrWrites[0]);
+        assert.ok(/^\d{4}-\d{2}-\d{2}T[\d:.]+Z \[info\] \[v=\d+\.\d+\.\d+\] native-attach: skip /.test(stderrWrites[0]!), `head format: ${stderrWrites[0]}`);
+        const content2 = fs.readFileSync(logFile, "utf8");
+        assert.equal(content2.split("code-fingerprint-mismatch").length - 1, 2, "one file line per run");
+    } finally {
+        process.stderr.write = origStderrWrite;
+        process.env.HOME = prevHome;
+        if (prevUserProfile === undefined) delete process.env.USERPROFILE;
+        else process.env.USERPROFILE = prevUserProfile;
+        if (prevXdgConfig === undefined) delete process.env.XDG_CONFIG_HOME;
+        else process.env.XDG_CONFIG_HOME = prevXdgConfig;
+        if (prevXdgData === undefined) delete process.env.XDG_DATA_HOME;
+        else process.env.XDG_DATA_HOME = prevXdgData;
+        if (prevXdgState === undefined) delete process.env.XDG_STATE_HOME;
+        else process.env.XDG_STATE_HOME = prevXdgState;
+        rmrf(home);
+    }
+});
+
+test("ensureProxyRunning non-debug: incompatible candidate skipped silently, reason in file, spawn proceeds (#3200)", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-3200-"));
+    const prevHome = process.env.HOME;
+    const prevUserProfile = process.env.USERPROFILE;
+    const prevXdgConfig = process.env.XDG_CONFIG_HOME;
+    const prevXdgData = process.env.XDG_DATA_HOME;
+    const prevXdgState = process.env.XDG_STATE_HOME;
+    process.env.HOME = home;
+    if (prevUserProfile !== undefined) process.env.USERPROFILE = home;
+    process.env.XDG_CONFIG_HOME = path.join(home, ".config");
+    process.env.XDG_DATA_HOME = path.join(home, ".local", "share");
+    process.env.XDG_STATE_HOME = path.join(home, ".local", "state");
+    const stderrWrites: string[] = [];
+    const origStderrWrite = process.stderr.write.bind(process.stderr);
+    process.stderr.write = ((chunk: unknown) => {
+        stderrWrites.push(String(chunk));
+        return true;
+    }) as typeof process.stderr.write;
+    // alive during pre-spawn discovery (a live incompatible candidate — the
+    // reported field case), dead once the spawn-wait loop re-reads it (so the
+    // #1753 pid-match fallback can settle on our own child)
+    let instPid = process.pid;
+    let spawned = 0;
+    try {
+        const handle = await ensureProxyRunning(
+            { host: "127.0.0.1", port: 0, passthrough: false, debug: false, lane: "pi" },
+            {
+                fetchImpl: async () => ({ ok: true }),
+                fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-1", pid: 42434, watchdog: { armed: true } }),
+                readInstanceFile: () => recordedInstance({ lane: "opencode", codeFingerprint: "deadbeef", pid: instPid }),
+                spawnImpl: () => {
+                    spawned++;
+                    instPid = 99999999;
+                    return makeFakeChild(42434);
+                },
+                sleep: () => Promise.resolve(),
+                scriptPath: FP_SCRIPT,
+            },
+        );
+        assert.equal(spawned, 1, "no attach target → fresh proxy spawned");
+        assert.ok(/^http:\/\/127\.0\.0\.1:\d+$/.test(handle.origin), `origin: ${handle.origin}`);
+        assert.equal(stderrWrites.length, 0, `terminal got bytes: ${JSON.stringify(stderrWrites)}`);
+        const content = fs.readFileSync(path.join(process.env.XDG_STATE_HOME!, "billion-context", "bili.log"), "utf8");
+        assert.ok(content.includes("native-attach: skip"), `log was: ${content}`);
+        assert.ok(content.includes("code-fingerprint-mismatch"), `log was: ${content}`);
+    } finally {
+        process.stderr.write = origStderrWrite;
+        process.env.HOME = prevHome;
+        if (prevUserProfile !== undefined) delete process.env.USERPROFILE;
+        else process.env.USERPROFILE = prevUserProfile;
+        if (prevXdgConfig === undefined) delete process.env.XDG_CONFIG_HOME;
+        else process.env.XDG_CONFIG_HOME = prevXdgConfig;
+        if (prevXdgData === undefined) delete process.env.XDG_DATA_HOME;
+        else process.env.XDG_DATA_HOME = prevXdgData;
+        if (prevXdgState === undefined) delete process.env.XDG_STATE_HOME;
+        else process.env.XDG_STATE_HOME = prevXdgState;
+        rmrf(home);
+    }
 });
 
 // #1753: the spawn-wait fallback must verify the healthy responder on the

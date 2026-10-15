@@ -605,6 +605,115 @@ def mitm_domains_from_config() -> List[str]:
     return hosts
 
 
+def _norm_base_url(url: Any) -> str:
+    """Lowercase, trailing-slash-stripped form used to compare a configured/hook base URL
+    against the URL half of a context-cache key."""
+    u = str(url or "").strip().lower()
+    return u.rstrip("/")
+
+
+def _base_url_origin(url: Any) -> str:
+    """scheme://host[:port] of a base URL — the cache keeps a path suffix (/v1) that some
+    configs omit, so a full-URL miss retries at origin granularity."""
+    u = _norm_base_url(url)
+    scheme, sep, rest = u.partition("://")
+    if not sep:
+        return u
+    return scheme + "://" + rest.split("/", 1)[0]
+
+
+def _provider_base_url(provider: Any) -> Optional[str]:
+    """The configured base URL of one hermes provider (best effort; same config keys as
+    mitm_domains_from_config). None when absent/unreadable."""
+    name = str(provider or "").strip()
+    if not name:
+        return None
+    cfg = hermes_home() / "config.yaml"
+    try:
+        data = _yaml_loader()(cfg.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+
+    def pick(entry: Any) -> Optional[str]:
+        if not isinstance(entry, dict):
+            return None
+        for key in ("base_url", "url", "api"):
+            if entry.get(key):
+                return str(entry[key]).strip()
+        return None
+
+    providers = data.get("providers")
+    if isinstance(providers, dict):
+        found = pick(providers.get(name))
+        if found:
+            return found
+    legacy = data.get("custom_providers")
+    if isinstance(legacy, list):
+        for entry in legacy:
+            if str((entry or {}).get("name") or "").strip() == name:
+                found = pick(entry)
+                if found:
+                    return found
+    return None
+
+
+def _request_base_url(request: Dict[str, Any], context: Dict[str, Any]) -> Optional[str]:
+    """Best-effort base URL of an outgoing request: hook/request-supplied fields first,
+    then the provider entry in config.yaml resolved by the hook's provider name."""
+    for source in (context, request):
+        for key in ("base_url", "url"):
+            v = source.get(key)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+    return _provider_base_url(context.get("provider"))
+
+
+def context_window_for(model: Any, base_url: Any = None) -> Optional[int]:
+    """#3261: the host's own known context window for a model, read from
+    HERMES_HOME/context_length_cache.yaml (flat mapping "<model>@<base_url>" -> tokens).
+    Fail-open to None on any miss/error so the proxy falls back to its normal window chain.
+    A stage matching several DIFFERENT windows yields nothing rather than a guess: an
+    overestimate risks preflight overflow, an underestimate over-compresses — both worse
+    than the default the proxy would otherwise use."""
+    name = str(model or "").strip()
+    if not name:
+        return None
+    cache_file = hermes_home() / "context_length_cache.yaml"
+    try:
+        data = _yaml_loader()(cache_file.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    pairs: List[Tuple[str, int]] = []
+    for key, value in data.items():
+        k = str(key)
+        at = k.find("@")
+        if at <= 0 or k[:at].strip() != name:
+            continue
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+            continue
+        pairs.append((_norm_base_url(k[at + 1 :]), int(value)))
+    if not pairs:
+        return None
+
+    def sole(values: List[int]) -> Optional[int]:
+        return values[0] if len(set(values)) == 1 else None
+
+    wanted = _norm_base_url(base_url) if base_url else ""
+    if wanted:
+        for stage in (
+            lambda u: u == wanted,
+            lambda u: _base_url_origin(u) == _base_url_origin(wanted),
+        ):
+            got = sole([v for u, v in pairs if stage(u)])
+            if got is not None:
+                return got
+    return sole([v for _, v in pairs])
+
+
 def _spawn_child(sidecar: Dict[str, str], port: int, token: str) -> Optional[subprocess.Popen]:
     log_path = os.path.join(tempfile.gettempdir(), f"bili-proxy-{port}.log")
     env = {k: v for k, v in os.environ.items() if k not in _PROXY_ENV_KEYS}
@@ -777,6 +886,9 @@ def on_llm_request(request: Optional[Dict[str, Any]] = None, **context: Any) -> 
         max_output = _state["max_output"].get(str(session_id))
         if isinstance(max_output, (int, float)) and max_output > 0:
             merged["x-bili-plugin-max-output"] = str(int(max_output))
+        window = context_window_for(model, _request_base_url(request, context))
+        if window is not None:
+            merged["x-bili-plugin-context-window"] = str(window)
         updated = dict(request)
         updated["extra_headers"] = merged
         return {"request": updated, "source": PLUGIN_ID, "reason": "plugin-mode headers"}
@@ -784,12 +896,14 @@ def on_llm_request(request: Optional[Dict[str, Any]] = None, **context: Any) -> 
         return None
 
 
-def report_runtime_info(model: str, max_output: Optional[int]) -> None:
+def report_runtime_info(model: str, max_output: Optional[int], context_window: Optional[int] = None) -> None:
     try:
         origin = _state.get("origin")
         if not origin:
             return
-        key: Tuple[Any, Any] = (model, int(max_output) if isinstance(max_output, (int, float)) else None)
+        mo = int(max_output) if isinstance(max_output, (int, float)) else None
+        cw = int(context_window) if isinstance(context_window, (int, float)) else None
+        key: Tuple[Any, Any, Any] = (model, mo, cw)
         sent: set = _state["runtime_info_sent"]
         if key in sent:
             return
@@ -797,8 +911,10 @@ def report_runtime_info(model: str, max_output: Optional[int]) -> None:
         if len(sent) > MAX_TRACKED_SESSIONS:
             sent.clear()
         body: Dict[str, Any] = {"agent": AGENT_NAME, "model": model[:256], "source": "hermes-native"}
-        if isinstance(max_output, (int, float)) and max_output > 0:
-            body["maxOutput"] = int(max_output)
+        if mo is not None and mo > 0:
+            body["maxOutput"] = mo
+        if cw is not None and cw > 0:
+            body["contextWindow"] = cw
 
         def send() -> None:
             http_post_json(origin.rstrip("/") + "/__bili/plugin/runtime-info", body, RUNTIME_INFO_TIMEOUT_S)
@@ -813,13 +929,17 @@ def on_pre_api_request(*, session_id: str = "", model: str = "", max_tokens: Any
     max output tokens for the NEXT request's header, and report runtime info to the proxy."""
     try:
         session = str(session_id or "")
+        table: "OrderedDict[str, int]" = _state["max_output"]
         if session and isinstance(max_tokens, (int, float)) and max_tokens > 0:
-            table: "OrderedDict[str, int]" = _state["max_output"]
             table[session] = int(max_tokens)
             while len(table) > MAX_TRACKED_SESSIONS:
                 table.popitem(last=False)
         if model:
-            report_runtime_info(str(model)[:256], table.get(session) if session else None)
+            report_runtime_info(
+                str(model)[:256],
+                table.get(session) if session else None,
+                context_window_for(model, _request_base_url({}, _)),
+            )
     except Exception:
         pass
 

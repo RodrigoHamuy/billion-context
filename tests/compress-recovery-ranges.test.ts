@@ -6,6 +6,13 @@ import { parseCompressInput } from "../src/compress-tool.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { getSession } from "../src/session.ts";
 import { applyRanges, type RewriteCtx } from "../src/stream.ts";
+import { liveCompressionRanges } from "../src/acp-status.ts";
+
+function spanContains(start: string, end: string, n: number): boolean {
+    const a = Number(start.replace(/\D/g, ""));
+    const b = Number(end.replace(/\D/g, ""));
+    return n >= Math.min(a, b) && n <= Math.max(a, b);
+}
 
 _setStoreForTest(new SessionStore({ enabled: false }));
 
@@ -162,4 +169,31 @@ test("unexpected compression exceptions and their repeat guard use current eligi
         assert.equal(result.text.split("\n").length, 1);
     }
     assert.equal(JSON.stringify(ctx.session.state.blocks), before);
+});
+
+test("#3192: a dropped message's DEAD ref is never re-advertised by the receipt or acp_status", () => {
+    const ctx = makeCtx(12);
+    // A client history rewrite drops message #5 (ref m00005) from the resent view;
+    // the failed compress recorded it as DEAD. Positionally the neighbours stay
+    // contiguous, so buildCompressibleRanges emits ONE span m00001–m00007 that
+    // brackets the dead ref — the exact self-contradiction from the issue.
+    ctx.messages.splice(4, 1);
+    ctx.session.state.deadRefs = ["m00005"];
+
+    const rejected = request(ctx, "m00001", "m00005");
+    assert.equal(rejected.outcome, "refused");
+    assert.match(rejected.text, /cannot be anchored/);
+    // No advertised compressible span may cross the dead ref m00005.
+    assert.doesNotMatch(rejected.text, /m0000[1-4]\s*[–-]\s*m0000[5-9]/);
+    // The only live span bracketed the dead ref -> stop instruction, not a doomed retry span.
+    assert.match(rejected.text, /continue the task without compressing/);
+    assert.doesNotMatch(rejected.text, /use these refs exactly as listed/);
+
+    // Receipt and acp_status share ONE eligibility source (liveCompressionRanges);
+    // pin that source so the two surfaces cannot drift apart again (#2778 promise).
+    const live = liveCompressionRanges(ctx);
+    assert.ok(live);
+    for (const r of live.ranges) {
+        assert.ok(!spanContains(r.startRef, r.endRef, 5), `${r.startRef}..${r.endRef} must not span the dead ref m00005`);
+    }
 });

@@ -450,11 +450,16 @@ function patchTextParts(
   if (textIndexes.length === 0) return [{ type: "input_text", text }, ...parts];
   const first = textIndexes[0];
   const remaining = new Set(textIndexes.slice(1));
-  return parts.map((part, index) => {
-    if (index === first) return { ...part, text };
-    if (remaining.has(index)) return { ...part, text: "" };
-    return part;
-  });
+  // Consolidate all text into the FIRST text part and DROP the others — never
+  // leave them as text:"" placeholders: strict Responses backends reject an
+  // empty input_text.text with 400 "text is required" (#3089).
+  const out: ResponseContentPart[] = [];
+  for (let index = 0; index < parts.length; index++) {
+    const part = parts[index];
+    if (!part || remaining.has(index)) continue;
+    out.push(index === first ? { ...part, text } : part);
+  }
+  return out;
 }
 
 function patchOriginalItem(

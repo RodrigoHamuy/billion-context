@@ -1,13 +1,18 @@
 import test, { after } from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { ensureProxyRunning } from "../src/launcher.ts";
-import { portZoneFilePath, readZonePort } from "../src/instance.ts";
-import { ZONE_PORT_BASE } from "../src/config.ts";
+import { isPidAlive, portZoneFilePath, readZonePort } from "../src/instance.ts";
+import { resolveZonePortBase } from "../src/config.ts";
+// #3182: in CI the zone-slot preload gives this file its own BILI_ZONE_PORT
+// band so concurrent live files never fight over the default base; locally
+// (plain npm test) this resolves to the exported default 18787.
+const ZONE_PORT_BASE = resolveZonePortBase();
+import { UPGRADE_REPLACEMENT_ENV } from "../src/listen-policy.ts";
 
 // #1660 live regression: the sticky-zone lifecycle against REAL proxy
 // processes — real spawn handshake, real EADDRINUSE ladder, real attach
@@ -24,8 +29,27 @@ const root = path.resolve(import.meta.dirname, "..");
 const distCli = path.join(root, "dist", "index.js");
 
 // CI's test step runs before `npm run build` — build on demand.
+/** #3182 family: a STALE dist is worse than a missing one — the test then
+ * exercises last week's product code and "fails" on fixes that exist (the
+ * #3044 marked-replacement hang was exactly this). Rebuild when any src/
+ * source is newer than the built entry. */
+function distStale(entry: string): boolean {
+    let newest = 0;
+    const walk = (dir: string): void => {
+        for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+            const p = path.join(dir, e.name);
+            if (e.isDirectory()) walk(p);
+            else if (/\.(ts|tsx)$/.test(e.name)) newest = Math.max(newest, fs.statSync(p).mtimeMs);
+        }
+    };
+    walk(path.join(root, "src"));
+    return fs.statSync(entry).mtimeMs < newest;
+}
+let distBuiltOnce = false;
 function ensureDistBuilt(): void {
-    if (!fs.existsSync(distCli)) {
+    if (distBuiltOnce && fs.existsSync(distCli) && !distStale(distCli)) return;
+    distBuiltOnce = true;
+    if (!fs.existsSync(distCli) || distStale(distCli)) {
         execFileSync(process.execPath, [path.join(root, "node_modules", "tsup", "dist", "cli-default.js")], {
             cwd: root,
             stdio: "pipe",
@@ -63,6 +87,17 @@ function killNow(pid: number | undefined): void {
     }
 }
 
+function portOpen(port: number): Promise<boolean> {
+    return new Promise((resolve) => {
+        const s = net.connect({ host: "127.0.0.1", port });
+        s.once("connect", () => {
+            s.destroy();
+            resolve(true);
+        });
+        s.once("error", () => resolve(false));
+    });
+}
+
 function freePort(): Promise<number> {
     return new Promise((resolve, reject) => {
         const srv = net.createServer();
@@ -97,15 +132,55 @@ async function squatted(port: number): Promise<net.Server> {
 // child's (the launcher builds the child env off process.env) — so
 // port-zone.json, the instance file and the #707 starting marker stay in a
 // throwaway sandbox.
+/** #3182: bounded wait for the band base to be free (teardown SIGKILLs
+ * return before the kernel releases the listener; under shard load the next
+ * test's first bind can land inside that window). Within this file's private
+ * band only our own earlier daemons can hold the base, so waiting is
+ * deterministic. Gives up after `ms` so a genuine wedge still fails loudly.
+ */
+async function waitForBandFree(port: number, ms = 10_000): Promise<void> {
+    const deadline = Date.now() + ms;
+    while (await portOpen(port)) {
+        if (Date.now() > deadline) {
+            throw new Error(`#3182: band base ${port} still occupied after ${ms}ms — an earlier scenario's daemon never released it`);
+        }
+        await new Promise((r) => setTimeout(r, 100));
+    }
+}
+
 async function withSandbox<T>(fn: () => Promise<T>): Promise<T> {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-zone-live-"));
-    const prev = process.env.XDG_STATE_HOME;
+    // Full XDG isolation, not just state: children inherit process.env, and
+    // a dev box's real config (e.g. storage.unified=full) or data dir makes
+    // every spawned daemon open the machine's real index.db and queue on its
+    // lock behind live daemons — the #3044 fail-fast then never fires within
+    // the test's patience (observed as a 120s hang). CI runners are hermetic;
+    // this restores that guarantee everywhere.
+    const prev = {
+        state: process.env.XDG_STATE_HOME,
+        config: process.env.XDG_CONFIG_HOME,
+        data: process.env.XDG_DATA_HOME,
+        cache: process.env.XDG_CACHE_HOME,
+    };
     process.env.XDG_STATE_HOME = path.join(home, "state");
+    process.env.XDG_CONFIG_HOME = path.join(home, "config");
+    process.env.XDG_DATA_HOME = path.join(home, "data");
+    process.env.XDG_CACHE_HOME = path.join(home, "cache");
     try {
+        // #3182: teardown kills tracked daemons with SIGKILL but returns
+        // without waiting for the kernel to release the listener. Under a
+        // concurrent shard runner the NEXT test can reach its first bind
+        // inside that window and eat a spurious EADDRINUSE on the band base.
+        // Wait (bounded) for the base to be free before every scenario —
+        // within this file's private band only our own earlier daemons can
+        // hold it, so this is deterministic, not a race.
+        await waitForBandFree(ZONE_PORT_BASE);
         return await fn();
     } finally {
-        if (prev === undefined) delete process.env.XDG_STATE_HOME;
-        else process.env.XDG_STATE_HOME = prev;
+        for (const [k, v] of Object.entries(prev)) {
+            if (v === undefined) delete process.env[`XDG_${k.toUpperCase()}_HOME`];
+            else process.env[`XDG_${k.toUpperCase()}_HOME`] = v;
+        }
     }
 }
 
@@ -166,11 +241,12 @@ test(
             const daemon1 = h1.child?.pid;
             trackKill(daemon1);
             let daemon2: number | undefined;
+            let squatter: net.Server | undefined;
             try {
                 assert.equal(h1.port, ZONE_PORT_BASE, "precondition: first launch on the base");
                 killNow(daemon1);
                 await new Promise((r) => setTimeout(r, 300)); // kernel releases the listen socket
-                const squatter = await squatted(ZONE_PORT_BASE);
+                squatter = await squatted(ZONE_PORT_BASE);
                 const h2 = await launch({ lane: "zcode" });
                 daemon2 = h2.child?.pid;
                 trackKill(daemon2);
@@ -185,6 +261,9 @@ test(
             } finally {
                 killNow(daemon1);
                 killNow(daemon2);
+                // #3182: close on failure paths too — a leaked listener on
+                // the band base starves the next test's waitForBandFree.
+                if (squatter) { try { squatter.close(); } catch {} }
             }
         });
     },
@@ -327,6 +406,102 @@ test(
                 killNow(daemon1);
                 killNow(daemon2);
                 fs.rmSync(v2Script, { force: true });
+            }
+        });
+    },
+);
+
+// ---------------------------------------------------------------------------
+// #3044: the orphan shape end-to-end. A self-restart replacement that cannot
+// grab the freed port must DIE LOUDLY instead of hopping +1 and idling as an
+// orphan nobody routes to. Spawned directly (not through ensureProxyRunning)
+// so the exact replacement env is under test control: launch token + lane
+// (which would earn it the #407 ladder pre-#3044) plus the bind-or-die marker.
+// ---------------------------------------------------------------------------
+
+test(
+    "zone live: marked upgrade-replacement fails fast on an occupied port instead of hopping (#3044)",
+    { timeout: 240_000, skip: LIVE ? process.platform !== "linux" : liveSkip },
+    async () => {
+        await withSandbox(async () => {
+            ensureDistBuilt();
+            // A non-bili squatter holds the zone base: no same-lane predecessor
+            // is recognized, so the marked child gets no wait budget at all —
+            // first EADDRINUSE must be its last breath. Under the pre-#3044
+            // ladder this exact spawn drifted to base+1 and idled there.
+            const squatter = await squatted(ZONE_PORT_BASE);
+            const child = spawn(
+                process.execPath,
+                [distCli, "start", "--host", "127.0.0.1", "--port", String(ZONE_PORT_BASE)],
+                {
+                    env: {
+                        ...process.env,
+                        BILI_LAUNCH_TOKEN: "3044-live-test",
+                        BILI_LAUNCHER_LANE: "zcode",
+                        [UPGRADE_REPLACEMENT_ENV]: "1",
+                    },
+                    stdio: "ignore",
+                    detached: true,
+                },
+            );
+            trackKill(child.pid);
+            try {
+                const exitCode = await new Promise<number | null | undefined>((resolve) => {
+                    child.once("exit", (code) => resolve(code));
+                    setTimeout(() => resolve(undefined), 120_000).unref();
+                });
+                assert.equal(exitCode, 1, "the marked replacement must fail fast with exit code 1 (upgrade pending, host decides retry)");
+                assert.equal(await portOpen(ZONE_PORT_BASE + 1), false, "nothing may have hopped onto the next port — that idle hopper IS the #3044 orphan shape");
+                assert.equal(await portOpen(ZONE_PORT_BASE), true, "the squatter still owns the base port");
+            } finally {
+                killNow(child.pid);
+                // #3182: close the squatter on failure too — a leaked
+                // listener on the band base starves waitForBandFree for the
+                // rest of the file (observed as the next test's 10s stall).
+                try { squatter.close(); } catch {}
+            }
+        });
+    },
+);
+
+test(
+    "zone live: unmarked lane'd spawn against a LIVE same-build twin exits instead of hopping (#3044)",
+    { timeout: 240_000, skip: LIVE ? process.platform !== "linux" : liveSkip },
+    async () => {
+        await withSandbox(async () => {
+            ensureDistBuilt();
+            // The 2026-10-13 recurrence shape: a host respawn raced an attach
+            // scan and spawned while an identical instance already served the
+            // lane's port. Before this fix that child laddered to base+1 and
+            // idled as an orphan; now the duplicate must lose loudly. Spawned
+            // directly (unmarked, exactly what the launcher produces) because
+            // ensureProxyRunning would attach to the twin and never spawn.
+            const h1 = await launch({ lane: "zcode" });
+            const daemon1 = h1.child?.pid;
+            trackKill(daemon1);
+            assert.equal(h1.port, ZONE_PORT_BASE, "precondition: the twin serves the zone base");
+            const child = spawn(
+                process.execPath,
+                [distCli, "start", "--host", "127.0.0.1", "--port", String(ZONE_PORT_BASE)],
+                {
+                    env: { ...process.env, BILI_LAUNCH_TOKEN: "3044-twin-test", BILI_LAUNCHER_LANE: "zcode" },
+                    stdio: "ignore",
+                    detached: true,
+                },
+            );
+            trackKill(child.pid);
+            try {
+                const exitCode = await new Promise<number | null | undefined>((resolve) => {
+                    child.once("exit", (code) => resolve(code));
+                    setTimeout(() => resolve(undefined), 120_000).unref();
+                });
+                assert.equal(exitCode, 1, "the duplicate must fail fast with exit code 1");
+                assert.equal(await portOpen(ZONE_PORT_BASE + 1), false, "nothing may have hopped onto the next port — the hopper IS the orphan shape");
+                assert.equal(await portOpen(ZONE_PORT_BASE), true, "the serving twin keeps its port");
+                assert.ok(daemon1 !== undefined && isPidAlive(daemon1), "the serving twin must still be alive");
+            } finally {
+                killNow(child.pid);
+                killNow(daemon1);
             }
         });
     },

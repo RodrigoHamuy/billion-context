@@ -65,7 +65,7 @@ async function harness(persist: boolean) {
         assert.equal(r.status, 200);
         await r.text();
     };
-    return { request, seed, messages, dir, store, upstreamUrl, origin, close: async () => { store.closeQuietly(); proxy.close(); upstream.close(); await Promise.all([once(proxy, "close"), once(upstream, "close")]); } };
+    return { request, seed, messages, dir, store, upstreamUrl, origin, close: async () => { store.closeQuietly(); proxy.close(); proxy.closeIdleConnections?.(); upstream.close(); upstream.closeIdleConnections?.(); await Promise.all([once(proxy, "close"), once(upstream, "close")]); } };
 }
 
 test("fork receipts cut pinned fork_base checkpoints that survive session deletion (#2960 ②)", async () => {

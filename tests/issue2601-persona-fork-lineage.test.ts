@@ -307,8 +307,10 @@ async function startRig(): Promise<Rig> {
 
 async function stopRig(rig: Rig): Promise<void> {
     rig.proxy.close();
+    rig.proxy.closeIdleConnections?.();
     await once(rig.proxy, "close");
     rig.relay.close();
+    rig.relay.closeIdleConnections?.();
     await once(rig.relay, "close");
 }
 

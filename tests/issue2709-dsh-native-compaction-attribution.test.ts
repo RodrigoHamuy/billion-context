@@ -62,11 +62,15 @@ test("inferred landing reaches the 'no second compressor' remediation, distinct 
     assert.match(text, /do not go hunting for a second plugin/);
 });
 
-test("marker-detected (confirmed) landing keeps its rebuild wording — no regression (#2709)", () => {
+test("marker-detected (recovered) landing gets the calm 'already rebased' framing, not an alarm (#2709/#2912)", () => {
     const s = makeSession("s");
     recordConflict(s, "native-compaction", "dsh native compaction: 40/120 covered id(s) replaced by the compacted history; ACP state rebased (#2432)");
     const text = formatConflictSection(conflictEventsOf(s)).join("\n");
-    assert.match(text, /rebuilds the fold state onto them where possible/);
+    // #2912: a marker-detected landing was already rebased onto (#2372/#2432) — say so plainly,
+    // and do NOT re-frame it as live double-compression or promise a rebuild.
+    assert.match(text, /ALREADY rebased onto/);
+    assert.doesNotMatch(text, /Two compressors on one conversation/);
+    assert.doesNotMatch(text, /rebuilds the fold state onto them where possible/);
     assert.doesNotMatch(text, /did NOT see the checkpoint marker/);
 });
 
@@ -79,11 +83,14 @@ test("plain unannounced rewrite stays UNCONFIRMED — false-positive guard (#270
     assert.doesNotMatch(text, /did NOT see the checkpoint marker/);
 });
 
-test("confirmed present alongside inferred wins the rebuild wording (#2709)", () => {
+test("inferred alongside a recovered landing: the higher-risk inferred framing wins (#2709/#2912)", () => {
     const s = makeSession("s");
     recordConflict(s, "native-compaction-inferred", "framing absent on replay; bili refused 3 client-native compaction call(s) this session [inferred] (#2709)");
     recordConflict(s, "native-compaction", "dsh native compaction: 40/120 covered id(s) replaced; ACP state rebased (#2432)");
     const text = formatConflictSection(conflictEventsOf(s)).join("\n");
-    assert.match(text, /rebuilds the fold state onto them where possible/);
-    assert.doesNotMatch(text, /did NOT see the checkpoint marker/);
+    // #2912: the recovered landing alone would stand down, but the co-present INFERRED landing
+    // could not be rebased onto — its higher-risk framing must win over the calm handled text.
+    assert.match(text, /did NOT see the checkpoint marker/);
+    assert.doesNotMatch(text, /rebuilds the fold state onto them where possible/);
+    assert.doesNotMatch(text, /ALREADY rebased onto/);
 });

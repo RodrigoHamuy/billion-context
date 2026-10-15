@@ -1,6 +1,6 @@
 {
   "name": "billion-context",
-  "version": "0.1.196",
+  "version": "0.1.197",
   "description": "A context-compression plugin — small context windows (a 100K context is enough), 5x fewer tokens, month-long single sessions (billions of tokens), and compression quality — for all agents: pi, OpenCode, Codex, Claude Code, and more. billion-context is all you need.",
   "type": "module",
   "main": "dist/index.js",
@@ -8,6 +8,7 @@
     ".": "./dist/agent/dsh-native.js",
     "./server": "./dist/agent/opencode-native.js",
     "./dsh": "./dist/agent/dsh-native.js",
+    "./package.json": "./package.json",
     "./dsh/package.json": "./package.json",
     "./client": "./dist/agent/dsh-native-client.js"
   },
@@ -24,8 +25,8 @@
     "typecheck": "tsc --noEmit --project tsconfig.json",
     "check:unused-exports": "node scripts/check-unused-exports.mjs",
     "check:test-import-graph": "node scripts/check-test-import-graph.mjs",
-    "pretest": "npm --prefix kernel run build && npm --prefix pi-subagents run build",
-    "test": "node --import ./tests/preload-storage-baseline.mjs --import tsx --test tests/*.test.ts",
+    "pretest": "node scripts/test-suite-lock.mjs gate && npm --prefix kernel run build && npm --prefix pi-subagents run build",
+    "test": "node scripts/test-suite-lock.mjs run",
     "start": "node dist/index.js",
     "test:e2e": "node --import tsx --test tests/e2e/e2e-codex.test.ts",
     "test:e2e:fake": "node --import tsx --test tests/e2e/e2e-codex-fake.test.ts",

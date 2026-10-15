@@ -191,8 +191,15 @@ entries:
     default: "on"
     env: BILI_STORAGE_JSON_WRITER
     group: process
-    desc_en: "Phase 3 envelope switch (#2960): off stops writing the legacy JSON session envelope while storage.unified is full - the SQLite index becomes the only persistent copy (reads are already unified-first; boot enumerates the index union, so index-only sessions load normally). Only honored in effective-full mode: under shadow/legacy (or with encryption active) the request is ignored with a one-time warning because the JSON file remains the sole source of truth. Env tier 0/false/off = off and 1/true/on = on wins over the strict file spellings. Fail-safe: if the sidecar disables itself mid-run, envelope writes resume on the next save. Rollback: unset the knob - writing resumes, index-only sessions keep loading via the boot union, and replicas/restore re-materialize portable JSON envelopes. The per-session content-store sidecar keeps being written either way. A jsonWriter=off lane must be the SOLE writer of its sessions directory: an off lane reads unified-first and never falls back to the file, so any peer instance running legacy/shadow against the same directory diverges silently (its JSON copy stops receiving updates, and the off lane never sees the peer's writes)."
-    desc_zh: "Phase 3 信封开关（#2960）：off 时若 storage.unified 为 full 则不再写 legacy JSON 会话信封 —— SQLite 索引成为唯一持久化副本（读路径本就 unified-first；boot 枚举索引并集，纯索引会话可正常加载）。仅在有效 full 模式下生效：shadow/legacy（或加密激活）下请求会被忽略并警告一次，因为 JSON 文件仍是唯一事实源。环境变量层 0/false/off = off、1/true/on = on，优先于严格拼写的文件层。失败安全：若边车运行中自禁用，下次保存即恢复信封写入。回滚：去掉该开关 —— 写入恢复，纯索引会话经 boot 并集继续可加载，replicas/restore 可重新物化可移植的 JSON 信封。每会话的 content-store 边车无论开关如何都照写。jsonWriter=off 的 lane 必须是其会话目录的唯一写者：off lane 读路径 unified-first、永不回退到文件，因此同一目录上跑 legacy/shadow 的对等实例会静默分叉（它的 JSON 副本收不到更新，off lane 也看不到对等实例的写入）。"
+    desc_en: "Phase 3 envelope switch (#2960): off stops writing the legacy JSON session envelope while storage.unified is full - the SQLite index becomes the only persistent copy (reads are already unified-first; boot enumerates the index union, so index-only sessions load normally). Only honored in effective-full mode: under shadow/legacy (or with encryption active) the request is ignored with a one-time warning because the JSON file remains the sole source of truth. Env tier 0/false/off = off and 1/true/on = on wins over the strict file spellings. Fail-safe: if the sidecar disables itself mid-run, envelope writes resume on the next save. Rollback: unset the knob - writing resumes, index-only sessions keep loading via the boot union, and replicas/restore re-materialize portable JSON envelopes. Downgrading the binary (or losing the SQLite engine) makes index-only sessions invisible to v0.1.196 and older until a >=v0.1.197 binary runs again - the data stays intact in index.db, it is just not read by the older code. The per-session content-store sidecar keeps being written either way. A jsonWriter=off lane must be the SOLE writer of its sessions directory: an off lane reads unified-first and never falls back to the file, so any peer instance running legacy/shadow against the same directory diverges silently (its JSON copy stops receiving updates, and the off lane never sees the peer's writes)."
+    desc_zh: "Phase 3 信封开关（#2960）：off 时若 storage.unified 为 full 则不再写 legacy JSON 会话信封 —— SQLite 索引成为唯一持久化副本（读路径本就 unified-first；boot 枚举索引并集，纯索引会话可正常加载）。仅在有效 full 模式下生效：shadow/legacy（或加密激活）下请求会被忽略并警告一次，因为 JSON 文件仍是唯一事实源。环境变量层 0/false/off = off、1/true/on = on，优先于严格拼写的文件层。失败安全：若边车运行中自禁用，下次保存即恢复信封写入。回滚：去掉该开关 —— 写入恢复，纯索引会话经 boot 并集继续可加载，replicas/restore 可重新物化可移植的 JSON 信封。降级二进制（或丢失 SQLite 引擎）会让纯索引会话在 v0.1.196 及更早版本上不可见，直到重新运行 >=v0.1.197 —— 数据在 index.db 中完好无损，只是旧代码不读它。每会话的 content-store 边车无论开关如何都照写。jsonWriter=off 的 lane 必须是其会话目录的唯一写者：off lane 读路径 unified-first、永不回退到文件，因此同一目录上跑 legacy/shadow 的对等实例会静默分叉（它的 JSON 副本收不到更新，off lane 也看不到对等实例的写入）。"
+  - key: storage.walJournalSizeLimitBytes
+    type: number
+    default: "8388608"
+    env: BILI_STORAGE_WAL_JOURNAL_SIZE_LIMIT_BYTES
+    group: process
+    desc_en: "WAL reclamation cap for index.db-wal (#3250), in bytes: every completed checkpoint truncates the WAL file back to this size, bounding disk use and crash-recovery replay in long-lived processes. NOT a per-session data quota - data lands in index.db as it is written and the WAL only stages frames between checkpoints, so session count/size does not scale this; a large burst can overshoot temporarily until the next completed checkpoint truncates back. Higher = rarer truncate IO but more steady disk use and a longer crash-replay tail. Env tier (positive integer) wins over the file tier; a garbage or non-positive env value falls through to the file/default tier instead of failing boot. Applied when the store opens at lane boot - hot edits need a restart. The effective value appears on the unified-enable log line and in the storage diagnostics blob."
+    desc_zh: "index.db-wal 的 WAL 回收上限（#3250），单位字节：每次完成的 checkpoint 把 WAL 文件截回该大小，约束长驻进程的磁盘占用与崩溃恢复重放。不是每会话数据配额 —— 数据写入时就已落进 index.db，WAL 只是两次 checkpoint 之间的帧暂存区，会话数量/大小不会放大它；大 burst 可能暂时超出，直到下一次完成的 checkpoint 截回。调大 = truncate IO 更稀疏，但稳态磁盘占用更多、崩溃恢复重放尾更长。环境变量层（正整数）优先于配置文件层；env 值非法或非正数时静默落到文件/默认层，boot 不崩。lane 启动、store open 时生效 —— 热改动需重启。实际取值会出现在 unified-enable 日志行与 storage 诊断块中。"
   - key: sessions
     type: object
     default: "{} (all defaults)"
@@ -212,11 +219,11 @@ entries:
     desc_zh: "内存会话表上限（空闲会话 LRU 逐出）。"
   - key: sessions.warmMax
     type: number
-    default: "8"
+    default: "0"
     env: BILI_SESSION_WARM_MAX
     group: process
-    desc_en: "Bounded startup (#2803): max most-recently-saved sessions hydrated at boot before listening; older state reloads on demand. 0 warms none. Capped by sessions.max."
-    desc_zh: "有界启动（#2803）：启动监听前预热加载的最近保存会话数上限，更早的状态按需重新加载。0 = 不预热。受 sessions.max 封顶。"
+    desc_en: "Bounded startup (#2803/#3050): max most-recently-saved sessions hydrated at boot before listening; older state reloads on demand. Default 0 (no eager warm set — first touch pays one on-demand load; set 8 to restore the eager behavior). Capped by sessions.max."
+    desc_zh: "有界启动（#2803/#3050）：启动监听前预热加载的最近保存会话数上限，更早的状态按需重新加载。默认 0（不预热——首次访问按需加载一次；设 8 恢复预热行为）。受 sessions.max 封顶。"
   - key: sessions.warmMaxBytes
     type: number
     default: "67108864"

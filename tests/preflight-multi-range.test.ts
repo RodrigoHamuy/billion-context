@@ -148,8 +148,10 @@ test("#574 regression: oldest range's summary unusable → preflight moves to th
         assert.ok(activeBlocks.length >= 1, `a later range was folded into a block (got ${activeBlocks.length})`);
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });
@@ -188,8 +190,10 @@ test("#574 truthful exhaustion: every range's summary unusable → honest 502 (f
         assert.equal(activeBlocks.length, 0, "no blocks created when nothing could be compressed");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });
@@ -243,8 +247,10 @@ test("#574 budget cap: many unusable ranges → the base cap (entry overshoot < 
         assert.equal(activeBlocks.length, 0, "no blocks created when nothing could be compressed");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });

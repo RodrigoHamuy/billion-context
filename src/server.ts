@@ -7,7 +7,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { performance } from "node:perf_hooks";
 import { createCore, type CompressionCore, type CompressionState, type Config, type CoreMessage, type NudgeDecision, type Prompts, type PackSurface, defaultPrompts, deactivateBlock } from "acp-kernel";
 import { resolveCompress, resolveCompressPrompts, resolveCompressSurfaceDetailed, resolveRequestConfig, type ResolvedKernelConfig } from "./compress-settings.js";
-import { dropCompressReasoning, type CompressReasoningConfig } from "./reasoning-drop.js";
+import { dropCompressReasoningIds, type CompressReasoningConfig } from "./reasoning-drop.js";
 import type { ProxyOptions, ResignSettings } from "./config.js";
 export type { ProxyOptions } from "./config.js";
 import { loadNamedProviders, loadOptions, loadRoutes } from "./config.js";
@@ -58,6 +58,7 @@ import { reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcil
 import { biliToolsDeclaredOnWire, countBiliToolUses, evaluateSelfHealRound, nudgeSuppressed, pluginLaneDegraded, pluginLaneRestore } from "./session-self-heal.js";
 import { getSession, hasProcessedState, listSessions, peekSession, type PendingRetrieval, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, totalInFlight, snapshotMessages, ensureCanonicalId, storeEffectiveConfig, foldCoverage, postRebuildAnchorTokens, setPostRebuildAnchor, tickPostRebuildAnchor, splitSessionWarnings, RESPONSES_TURN_SEPARATOR_ID_PREFIX } from "./session.js";
 import { detectStaleInstall } from "./update.js";
+import { decideEaddrinuse, postBindCanLadder, UPGRADE_REPLACEMENT_ENV } from "./listen-policy.js";
 import { getAdvisoryState, cannotResolveTarget } from "./advisory.js";
 import { PACKAGE_NAME, VERSION } from "./version.js";
 import {
@@ -98,7 +99,8 @@ import { getStore } from "./persist.js";
 import { log as loggerLog, configureLogger, getLogPath, closeLogger, isFileLoggingActive, isStreamWriteError, isBenignSocketRaceError, enterSessionContext, muteStderrLeg } from "./logger.js";
 import { queryLogLines } from "./web/logs-query.js";
 import { configFile, defaultLogFile, stateDir } from "./paths.js";
-import { atomicWriteInstanceFile, clearProxyInstanceFile, entryScriptFingerprint, findSameLanePredecessor, isPidAlive, listInstances, registerInstanceAndWarn, unregisterInstance, warnOnNewPeers, type ProxyInstanceFile } from "./instance.js";
+import { atomicWriteInstanceFile, clearProxyInstanceFile, entryScriptFingerprint, findSameLanePredecessor, findSameLaneTwin, isPidAlive, listInstances, readProxyInstanceFile, registerInstanceAndWarn, unregisterInstance, warnOnNewPeers, type ProxyInstanceFile, type RegistryEntry } from "./instance.js";
+import { mayClobberPointer, probeOwnerInfo, resolvePortClaim } from "./port-owner.js";
 import { hoistTrappedToolItems } from "./tool-pair-order.js";
 import { computeAnthropicMessageMarks, stampAnthropicSystemCacheControl, anthropicToolsCarryCacheControl } from "./loop/cache-control.js";
 import { reconcileSystemAnchor } from "./system-anchor.js";
@@ -144,7 +146,7 @@ import {
     streamKeepAliveMs as knobStreamKeepAliveMs,
 } from "./knobs.js";
 import { BILI_HOP_HEADER, anthropicBetaContextWindow, capRegistryWindowByStandard, expandedContextSuffixWindow, LAUNCHER_MODEL_WINDOWS, LAUNCHER_MODEL_MAX_OUTPUTS, launcherContextWindow, launcherMaxOutput, parseLauncherModelWindows, windowSourceLogged } from "./server/context-window.js";
-import { connectionNamedHeaders, NO_IDENTITY_MESSAGE, UPSTREAM_HOP_HEADERS } from "./server/headers.js";
+import { connectionNamedHeaders, NO_IDENTITY_MESSAGE, stripRemoteCompactionBetaFeature, UPSTREAM_HOP_HEADERS } from "./server/headers.js";
 import { installWebSocketBridge } from "./ws-bridge.js";
 import { codexResponsesCodec, responsesCodec } from "./responses-ws.js";
 import { currentFetchTransport } from "./fetch-transport.js";
@@ -154,6 +156,7 @@ import { clampOutgoingOutput, countSystemAndToolsTokens, emergencyNudge, estimat
 import { pipeThrough } from "./server/stream-io.js";
 import { artifactSeedHit, detectAcpArtifacts } from "./server/chain-artifacts.js";
 import { droppedOpenaiParts } from "./wire-drop-warn.js";
+import { BP_MAX, ROLLOUT_FEATURES, rolloutDecisions, rolloutInstallId, warnRolloutConfigProblems } from "./rollout.js";
 export { forward } from "./server/relay.js";
 
 // #1086/#1218: the per-session chain-verdict memory moved to plugin.ts
@@ -315,6 +318,33 @@ export function requestWatchdogBudgetMs(): number {
     return knobRequestWatchdogBudgetMs();
 }
 
+// Test seam (#3091, mirrors #1770 in fetch-util): stretch the request
+// watchdog's WALL-CLOCK fire delay without changing its logical budget.
+// Asserting "a healthy stream longer than the idle budget survives" against
+// real-timer scheduling is nondeterministic under host load — the fake
+// upstream's pacing tick, the proxy's forward writes and the expired watchdog
+// timer share ONE event loop, and under CPU starvation (observed on
+// windows/node-24 CI) the timer phase can fire before the next byte reaches
+// the client, cutting a healthy stream no matter how wide the nominal margin.
+// null = production behavior (inert by default).
+let requestWatchdogDelayOverrideMs: number | null = null;
+export function _setRequestWatchdogDelayForTest(ms: number | null): void {
+    requestWatchdogDelayOverrideMs = ms;
+}
+
+// Test seam (#3091): how many times the watchdog has re-armed on a write since
+// the last reset — a deterministic observation of the re-arm-per-write wiring
+// that wall-clock survival assertions cannot pin reliably under load. This is
+// what keeps "idle, not total-time" testable once the wall clock is decoupled.
+let requestWatchdogRearmCount = 0;
+export function _requestWatchdogRearmCountForTest(): number {
+    return requestWatchdogRearmCount;
+}
+export function _resetRequestWatchdogSeamsForTest(): void {
+    requestWatchdogDelayOverrideMs = null;
+    requestWatchdogRearmCount = 0;
+}
+
 function armRequestWatchdog(req: http.IncomingMessage, res: http.ServerResponse, log: (level: string, msg: string) => void): void {
     const budgetMs = requestWatchdogBudgetMs();
     if (!Number.isFinite(budgetMs) || budgetMs <= 0) return; // operator opted out
@@ -337,7 +367,7 @@ function armRequestWatchdog(req: http.IncomingMessage, res: http.ServerResponse,
     };
     const arm = (): void => {
         if (timer) clearTimeout(timer);
-        timer = setTimeout(fire, budgetMs);
+        timer = setTimeout(fire, requestWatchdogDelayOverrideMs ?? budgetMs);
         timer.unref?.();
     };
     // Re-arm on every byte written toward the client. Bind the original so the
@@ -346,6 +376,7 @@ function armRequestWatchdog(req: http.IncomingMessage, res: http.ServerResponse,
     const origWrite = res.write.bind(res);
     res.write = ((...args: Parameters<typeof origWrite>) => {
         arm();
+        requestWatchdogRearmCount += 1;
         return origWrite(...args);
     }) as typeof res.write;
     res.on("close", () => { if (timer) clearTimeout(timer); });
@@ -409,6 +440,13 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // (the chain check only compares against the other running instance).
     const instanceId = randomUUID();
     const instanceStartedAt = Date.now();
+    // #2941: the bind happens BEFORE announceListening writes this instance's
+    // identity files (pointer + registry entry), and the health route is
+    // stateless — so between bind and registration a probe sees "healthy" for
+    // an instance no discovery pass can find, and a concurrent same-lane
+    // launcher spawns a duplicate instead of attaching or waiting. The health
+    // endpoint reports not-ready until registration completes.
+    let bootReady = false;
     // #7 (shared stable-port proxy): the parent-gone watchdog watches a SET of
     // pids, not one. The spawning hook seeds it via BILI_PARENT_PID; every
     // ATTACHING session (POST /__bili/watcher) adds its claude host, so a
@@ -467,7 +505,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // as the context-window source for zero-config `/p/` routes that have no
     // per-model config. A miss falls back to the prefix table + default.
     void loadRegistry();
-    const adminCtx = { opts, core, config, log, instanceId, instanceStartedAt, proxyWatchers, initialWatcherPid };
+    const adminCtx = { opts, core, config, log, instanceId, instanceStartedAt, proxyWatchers, initialWatcherPid, bootReady: () => bootReady };
 
     const dispatch = async (req: http.IncomingMessage, res: http.ServerResponse): Promise<void> => {
         armRequestWatchdog(req, res, log);
@@ -505,7 +543,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // Generic WebSocket bridge: protocol codecs claim upgrades here (#1467
     // phase-2 shell); the Responses codec is the first (and currently only)
     // entry. Unclaimed upgrades still fall through to the 426 contract below.
-    const wsUpgrade = installWebSocketBridge(server, dispatch, log, [responsesCodec, codexResponsesCodec], (url) => resolveProxyDecision(opts.routes, opts.proxy, url, opts.proxyFallback).proxy !== undefined);
+    const wsUpgrade = installWebSocketBridge(server, dispatch, log, [responsesCodec, codexResponsesCodec], (url) => resolveProxyDecision(opts.routes, opts.proxy, url, opts.proxyFallback).proxy !== undefined, instanceId);
     // Unclaimed upgrades retain the immediate HTTP fallback contract.
     // An explicit 'upgrade' listener is
     // required: without one Node's behavior is version-dependent (some
@@ -862,6 +900,11 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // "success" would strand every model request on the dead original port.
     const launchToken = process.env.BILI_LAUNCH_TOKEN?.trim();
     const strictPort = process.env.BILI_STRICT_PORT === "1";
+    // #3044: a self-restart replacement must own exactly the port its
+    // predecessor freed — it fails fast instead of inheriting the +1 ladder
+    // (hopping strands it serving no client while the old instance keeps the
+    // real port: the orphan leak #3044 reports).
+    const upgradeReplacement = process.env[UPGRADE_REPLACEMENT_ENV] === "1";
     // #1225: lane identity + code fingerprint recorded into the instance file
     // so later launches can decide reuse by WHO started us and WHICH code we
     // run — not just config shape (same-version stale dist kept serving after
@@ -891,19 +934,26 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         }
         return pred !== undefined;
     };
-    const announceListening = (): void => {
-        const actualPort = server.address() === null ? opts.port : (server.address() as { port: number }).port;
+    // Discovery origin local MCP shells dial: collapse wildcard
+    // binds to loopback (localhost may resolve to ::1, where an
+    // IPv4-only listener is absent) and bracket bare IPv6 literals
+    // so the file always holds a valid URL.
+    const boundOrigin = (actualPort: number): string => {
+        const originHost = opts.host === "0.0.0.0" || opts.host === "::" || opts.host === "localhost" ? "127.0.0.1" : opts.host.includes(":") && !opts.host.startsWith("[") ? `[${opts.host}]` : opts.host;
+        return `http://${originHost}:${actualPort}`;
+    };
+    const announceListening = async (): Promise<void> => {
+        // #2941: closed between bind and announce (fast exit, test teardown) —
+        // announcing would register a dead listener under the configured port
+        // (port 0 → bogus http://host:0 banners/registry records); skip entirely.
+        if (server.address() === null) return;
+        const actualPort = (server.address() as { port: number }).port;
         const nonLoopbackBind = opts.host === "0.0.0.0" || opts.host === "::" || !isLoopbackAddress(opts.host);
         // Honest bind display: a wildcard bind shows as 0.0.0.0 (the user
         // chose to expose the proxy — hiding it behind "localhost" made
         // remote setups look broken in the log, see #240).
         const displayHost = nonLoopbackBind ? opts.host : opts.host === "0.0.0.0" ? "localhost" : opts.host;
-        // Discovery origin local MCP shells dial: collapse wildcard
-        // binds to loopback (localhost may resolve to ::1, where an
-        // IPv4-only listener is absent) and bracket bare IPv6 literals
-        // so the file always holds a valid URL.
-        const originHost = opts.host === "0.0.0.0" || opts.host === "::" || opts.host === "localhost" ? "127.0.0.1" : opts.host.includes(":") && !opts.host.startsWith("[") ? `[${opts.host}]` : opts.host;
-        const origin = `http://${originHost}:${actualPort}`;
+        const origin = boundOrigin(actualPort);
         const instanceRecord: ProxyInstanceFile = {
             origin,
             instanceId,
@@ -926,7 +976,21 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
             //  restores the pre-#2265 exact-hash-only resolution (hot kill-switch).
             setSimhashAdoptionEnabled(opts.affinitySimhash ?? true);
             hydratePrefixAffinity();
-            atomicWriteInstanceFile(instanceRecord);
+            // #2941: never clobber a live pointer on this port — a foreign
+            // instance health-verified as serving here keeps it; our registry
+            // entry below still records us for lane-aware discovery.
+            const guard = await mayClobberPointer({
+                candidateOrigin: origin,
+                candidateInstanceId: instanceId,
+                read: readProxyInstanceFile,
+                isAlive: isPidAlive,
+                healthOf: probeOwnerInfo,
+            });
+            if (guard.allow) {
+                atomicWriteInstanceFile(instanceRecord);
+            } else if (guard.holder !== undefined) {
+                log("warn", `[pointer] keeping proxy-origin held by live instance ${guard.holder.instanceId.slice(0, 8)} (pid ${guard.holder.pid}, ${guard.holder.origin}) on this port — refusing to clobber a live pointer (#2941)`);
+            }
         } catch {
             // best-effort discovery hint for host-spawned MCP shells
         }
@@ -1008,6 +1072,23 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         if (envKnobs.length > 0) {
             log("info", `[config] env overrides active (win over the config file): ${envKnobs.join(", ")}`);
         }
+        // #3062: rollout state for the registry — the whole block is skipped
+        // while the registry is empty (the mechanism ships gating nothing; each
+        // adopter adds its own entry). The id prefix + bucket numbers let
+        // support tickets answer "why is feature X off for me" from one line.
+        warnRolloutConfigProblems();
+        if (Object.keys(ROLLOUT_FEATURES).length > 0) {
+            const rolloutId = rolloutInstallId();
+            const gated = rolloutDecisions(rolloutId);
+            if (gated.length > 0) {
+                log(
+                    "info",
+                    `[rollout] install ${rolloutId.slice(0, 8)} — ${gated
+                        .map((d) => `${d.feature}=${d.enabled ? "on" : "off"}(${d.source}, ${d.bucket}/${BP_MAX} vs ${d.percentBp}bp${d.base ? `, base ${d.base}` : ""})`)
+                        .join(", ")}`,
+                );
+            }
+        }
         if (nonLoopbackBind) {
             log(
                 "warn",
@@ -1017,10 +1098,60 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         if (opts.debug) {
             log("info", `[debug] build features: raw-HTTP-capture(${bodyDumpEnabled() ? "on" : "off"}) | remote_compaction_v2-strip(on) | cert-MITM-launcher(on) | strip-acp-summary(on) — seeing this line confirms the launcher build (not registry 0.1.34)`);
         }
+        // #2941: LAST statement — registration above is done; degraded boots
+        // (best-effort write failed) still flip ready, serving as before.
+        bootReady = true;
+    };
+    // #2941: after a successful bind, verify we are the SOLE owner of the
+    // port before registering. Where socket semantics tolerate a concurrent
+    // bind onto an actively-listening port, a same-lane double spawn would
+    // otherwise serve ONE port from two state machines silently; stock libuv
+    // enforces exclusivity (EADDRINUSE ladder below), so this is a defensive
+    // second layer — see src/port-owner.ts.
+    const claimOrAnnounce = (): void => {
+        void (async () => {
+            const addr = server.address();
+            if (addr !== null && typeof addr === "object") {
+                const outcome = await resolvePortClaim({
+                    origin: boundOrigin(addr.port),
+                    ownPid: process.pid,
+                    canLadder: postBindCanLadder(Boolean(launchToken), strictPort, upgradeReplacement),
+                    listenAttempts,
+                    maxListenAttempts: MAX_LISTEN_ATTEMPTS,
+                });
+                if (outcome.kind === "ladder") {
+                    listenAttempts += 1;
+                    log("warn", `port ${lastTriedPort} shared with foreign listener (pid ${outcome.foreign.pid}) — ${outcome.nextPort === 0 ? "retrying on an ephemeral port" : `retrying on port ${outcome.nextPort}`} (#2941)`);
+                    // closeAllConnections: idle keep-alive sockets from early
+                    // probes must not stall the re-listen callback.
+                    server.close(() => attemptListen(outcome.nextPort));
+                    server.closeAllConnections?.();
+                    return;
+                }
+                if (outcome.kind === "die") {
+                    log("error", `listen failed: ${outcome.message}`);
+                    shuttingDown = true;
+                    server.close();
+                    flushConversations();
+                    void flushAllSessions().finally(() => {
+                        closeLogger();
+                        process.exit(1);
+                    });
+                    return;
+                }
+            }
+            await announceListening();
+        })();
     };
     const attemptListen = (port: number): void => {
         lastTriedPort = port;
-        server.listen(port, opts.host, announceListening);
+        // #2941: a failed listen never fires 'listening', so each attempt's
+        // callback stacks on the server and a later successful bind fires ALL
+        // accumulated claimOrAnnounce closures at once (double announce,
+        // double registration, MaxListenersExceededWarning on long waits).
+        // Only our own callbacks ever use this event.
+        server.removeAllListeners("listening");
+        server.listen(port, opts.host, claimOrAnnounce);
     };
     attemptListen(opts.port);
     // Listen errors (EADDRINUSE port taken, EACCES privileged port, EAFNOSUPPORT
@@ -1029,23 +1160,43 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // graceful-shutdown flush can run. Catch, log a human-readable message,
     // flush sessions, and exit cleanly (exit code 1 so callers/scripts notice).
     server.on("error", (err: NodeJS.ErrnoException) => {
-        if (err.code === "EADDRINUSE" && launchToken && !strictPort && listenAttempts < MAX_LISTEN_ATTEMPTS) {
-            if (predecessorTicksLeft > 0 && sameLanePredecessorHolds(lastTriedPort)) {
+        let busyReason: "upgrade-replacement" | "strict-port" | "port-busy" | "twin-collision" | undefined;
+        let twin: RegistryEntry | undefined;
+        if (err.code === "EADDRINUSE") {
+            twin = findSameLaneTwin(listInstances(), lastTriedPort, launcherLane, ownFingerprint);
+            const action = decideEaddrinuse({
+                upgradeReplacement,
+                twinHolds: twin !== undefined,
+                launchToken: launchToken !== undefined,
+                strictPort,
+                attempts: listenAttempts,
+                maxAttempts: MAX_LISTEN_ATTEMPTS,
+                predecessorTicksLeft,
+                predecessorHolds: sameLanePredecessorHolds(lastTriedPort),
+                lastTriedPort,
+            });
+            if (action.kind === "wait-predecessor") {
                 predecessorTicksLeft -= 1;
-                setTimeout(() => attemptListen(lastTriedPort), PREDECESSOR_WAIT_MS);
+                setTimeout(() => attemptListen(action.port), PREDECESSOR_WAIT_MS);
                 return;
             }
-            listenAttempts += 1;
-            const next = listenAttempts === MAX_LISTEN_ATTEMPTS ? 0 : lastTriedPort + 1;
-            log("warn", `port ${lastTriedPort} busy — ${next === 0 ? "retrying on an ephemeral port" : `retrying on port ${next}`}`);
-            attemptListen(next);
-            return;
+            if (action.kind === "ladder") {
+                listenAttempts += 1;
+                log("warn", `port ${lastTriedPort} busy — ${action.nextPort === 0 ? "retrying on an ephemeral port" : `retrying on port ${action.nextPort}`}`);
+                attemptListen(action.nextPort);
+                return;
+            }
+            busyReason = action.reason;
         }
         const hint =
             err.code === "EADDRINUSE"
-                ? strictPort
-                    ? ` — port ${lastTriedPort} is pinned (strict-port mode) but already in use. Free it or point the client at another port (e.g. BILI_CLAUDE_NATIVE_PORT for the claude native posture).`
-                    : ` — port ${lastTriedPort} is already in use. Stop the other process or use --port <N>.`
+                ? busyReason === "twin-collision"
+                  ? ` — port ${lastTriedPort} is already served by a same-build bili instance (pid ${twin?.pid}, lane ${launcherLane}) — exiting instead of hopping: the duplicate loses and the serving instance keeps serving; the next launch will attach to it (#3044).`
+                  : busyReason === "upgrade-replacement"
+                    ? ` — this process is an upgrade-restart replacement (#3044): it must own port ${lastTriedPort} exactly, but the prior instance still holds it. Exiting instead of hopping to ${lastTriedPort + 1} — a drifted replacement serves no client and leaks while the prior instance keeps serving; the upgrade retries on the next cooldown cycle.`
+                    : busyReason === "strict-port"
+                      ? ` — port ${lastTriedPort} is pinned (strict-port mode) but already in use. Free it or point the client at another port (e.g. BILI_CLAUDE_NATIVE_PORT for the claude native posture).`
+                      : ` — port ${lastTriedPort} is already in use. Stop the other process or use --port <N>.`
                 : err.code === "EACCES"
                   ? ` — port ${lastTriedPort} requires privileges. Use a port >= 1024.`
                   : "";
@@ -1231,6 +1382,17 @@ export type Prepared = {
      *  correction actually reaches the model. */
     attachedRetrievalNoteIds?: string[];
     nudge?: NudgeDecision;
+    /** #3004: post-gate delivery fact for this round's armed nudge — what
+     * ACTUALLY reached the payload, not the pre-gate intent. The model-decided
+     * gate runs asynchronously between diagNudge's label and the rebuild, so
+     * consumers that need truth (self-heal streaks, log labels) read this.
+     * "injected": an advisory/directive/fallback message landed; "vetoed":
+     * the decision gate ran and nothing was injected (model declined or the
+     * answer was unusable); "skipped": armed but nothing renderable (empty
+     * nudge text / yes-with-no-live-range). Undefined = no arm this round, or
+     * the arm was gated off before delivery was attempted (suppression /
+     * breaker / gate off) — consumers only ever test for "injected". */
+    nudgeOutcome?: "injected" | "vetoed" | "skipped";
     /** Render strategy the prepare used for processTurn ("none" for codex
      *  compaction triggers / ACP_RENDER_NONE). The #422 fold-refresh hook in
      *  forward() re-runs processTurn with the same strategy so the re-request
@@ -1260,7 +1422,7 @@ export type Prepared = {
     /** Set when a codex native-compaction request was intercepted and a
      *  success response was forged locally (BILI_CODEX_COMPACT=intercept +
      *  gate passed). forward() serves `body` without contacting upstream. */
-    codexForge?: { kind: "endpoint" | "trigger"; body: string; contentType: string };
+    codexForge?: { kind: "endpoint" | "trigger" | "prompt"; body: string; contentType: string };
 };
 
 
@@ -1386,18 +1548,22 @@ const ACP_TAG_MARK = "\x3cacp ";
 // nonexistent (preflight), so acp_summary survives as the carrier and
 // systemToUser later re-voices the survivors as USER messages (leaving them at
 // their anchors) for strict backends (#377).
-/** [#651] Strip oversized reasoning from closed compress turns (see
- *  src/reasoning-drop.ts) with an ops log line when anything was dropped. */
-export function withReasoningDrop(
+/** [#3222] Compute #651's drop set BEFORE core.processTurn runs: the kernel's
+ *  hide-compress-calls node removes inactive-block call+result pairs INSIDE
+ *  processTurn, so a pass computed on the post-turn view has lost its anchors
+ *  and leaks the pre-call reasoning forever (applies to the bare name too).
+ *  The inbound history always carries them. Kernel message ids are never
+ *  reused within a session, so the id set stays valid across the post-turn
+ *  view AND the relay round-2 re-render alike. Empty set = nothing to drop
+ *  (disabled or no match) → applyReasoningDrop is a no-op. */
+export function planReasoningDrop(
     msgs: BiliMessage[],
     reasoning: CompressReasoningConfig | undefined,
-    log: (level: string, msg: string) => void,
-    sessionId: string,
     strictEcho: boolean,
-): BiliMessage[] {
+): Set<string> {
     // [#684] strict-echo upstreams: reasoning must round-trip with tool_calls,
     // so #651's drop must not fire. Learned/static strictness both land here.
-    if (strictEcho) return msgs;
+    if (strictEcho) return new Set();
     // [#1658] Anthropic-wire twin of that gate, detected from the payload
     // itself: a reasoning message carrying a signature is a SIGNED thinking
     // block on the wire (the kernel stamps thinkingSignature from the wire
@@ -1407,12 +1573,40 @@ export function withReasoningDrop(
     // any signed thinking in view disables the drop for this request.
     // Presence-based and per-request: Claude sessions without extended
     // thinking keep #651's savings.
-    if (msgs.some((m) => m.contentType === "reasoning" && typeof m.thinkingSignature === "string" && m.thinkingSignature.length > 0)) return msgs;
-    const out = dropCompressReasoning(msgs, reasoning);
+    if (msgs.some((m) => m.contentType === "reasoning" && typeof m.thinkingSignature === "string" && m.thinkingSignature.length > 0)) return new Set();
+    return dropCompressReasoningIds(msgs, reasoning);
+}
+
+/** Apply a planReasoningDrop set to any view derived from the same inbound
+ *  history (steady post-turn view, relay round-2 re-render). Ops log line
+ *  when anything was dropped. */
+export function applyReasoningDrop(
+    msgs: BiliMessage[],
+    plan: Set<string>,
+    log: (level: string, msg: string) => void,
+    sessionId: string,
+): BiliMessage[] {
+    if (plan.size === 0) return msgs;
+    const out = msgs.filter((m) => !plan.has(m.id));
     if (out.length !== msgs.length) {
         log("info", `[${sessionId}] compress-reasoning: dropped ${msgs.length - out.length} reasoning message(s) from closed compress turns (#651)`);
     }
     return out;
+}
+
+/** [#651] Strip oversized reasoning from closed compress turns (see
+ *  src/reasoning-drop.ts) with an ops log line when anything was dropped.
+ *  Standalone form for callers holding an anchor-intact array (tests, ad-hoc
+ *  views); the steady request path plans around core.processTurn via
+ *  planReasoningDrop/applyReasoningDrop (#3222). */
+export function withReasoningDrop(
+    msgs: BiliMessage[],
+    reasoning: CompressReasoningConfig | undefined,
+    log: (level: string, msg: string) => void,
+    sessionId: string,
+    strictEcho: boolean,
+): BiliMessage[] {
+    return applyReasoningDrop(msgs, planReasoningDrop(msgs, reasoning, strictEcho), log, sessionId);
 }
 
 // #2864: identity dedup shared by the three reasoning-pair sentinels below.
@@ -1804,7 +1998,7 @@ export function diagTagSummary(messages: CoreMessage[], sessionId: string, strat
     return `[${sessionId}] processTurn: ${messages.length} msgs, renderTags=${strategy}, ${textTagged} text tagged, ${toolTagged} tool tagged (should be 0 with text-only)`;
 }
 
-export function diagNudge(turn: { nudge?: { shouldInject: boolean; reason: string; contextUsage: number; tier: number | null; breakdown?: Record<string, number> } | null }, sessionId: string, tokenCount: number, limit: number, model: string | undefined, willInject: boolean): string {
+export function diagNudge(turn: { nudge?: { shouldInject: boolean; reason: string; contextUsage: number; tier: number | null; breakdown?: Record<string, number> } | null }, sessionId: string, tokenCount: number, limit: number, model: string | undefined, willInject: boolean, decidePending = false): string {
     const n = turn.nudge;
     if (!n) return `[${sessionId}] nudge: unavailable`;
     const b = n.breakdown ?? {};
@@ -1816,9 +2010,12 @@ export function diagNudge(turn: { nudge?: { shouldInject: boolean; reason: strin
     const ref = b["growthReference"] ?? 0;
     // "INJECT" only when the nudge actually reaches the upstream payload. When
     // armed but suppressed by config/mode, say so explicitly so the log never
-    // lies about delivery (#451, same class as #413).
+    // lies about delivery (#451, same class as #413). #3004: when the
+    // model-decided gate still has to run, delivery is NOT settled at label
+    // time — say PENDING (the [acp-decide] verdict line follows) instead of
+    // claiming INJECT for a round the model may veto.
     const inject = willInject
-        ? (n.shouldInject ? `INJECT T${n.tier ?? "?"}` : `INJECT-ESC T${n.tier ?? "?"}`)
+        ? (decidePending ? `INJECT-PENDING T${n.tier ?? "?"}` : (n.shouldInject ? `INJECT T${n.tier ?? "?"}` : `INJECT-ESC T${n.tier ?? "?"}`))
         : (n.shouldInject ? `ARMED-SUPPRESSED T${n.tier ?? "?"}` : "idle");
     const modelTag = model ? ` model=${model}` : "";
     return `[${sessionId}] nudge ${inject}: usage=${pct} (${tokenCount}/${limit}), growth=${growth}/${floor} (ref=${ref}, interval=${interval}), pendingT1=${pendingT1}/${interval}${modelTag}, reason="${n.reason.slice(0, 120)}"`;
@@ -2100,20 +2297,9 @@ export function buildForwardTarget(
         if (!(isLoopbackAddress(req.socket.remoteAddress) && destLoopback && destAdminPath)) headers[BILI_TUNNEL_HEADER] = "1";
     }
     headers["host"] = new URL(upstreamUrl).host;
-    // codex advertises its own server-side context compaction via this beta
-    // feature. It conflicts with bili's client-side compress (bili IS the
-    // compression layer) and third-party aggregators reject it with
-    // "invalid range / ref not found". Strip it so bili's compress is the
-    // sole mechanism.
-    const betaKey = Object.keys(headers).find((h) => h.toLowerCase() === "x-codex-beta-features");
-    if (betaKey) {
-        const kept = headers[betaKey]
-            .split(",")
-            .map((s) => s.trim())
-            .filter((f) => f && f !== "remote_compaction_v2");
-        if (kept.length > 0) headers[betaKey] = kept.join(",");
-        else delete headers[betaKey];
-    }
+    // #3073: shared with the WS lane's final egress so probe and turn carry
+    // the same beta surface (see stripRemoteCompactionBetaFeature).
+    stripRemoteCompactionBetaFeature(headers);
     // Forward a client-provided Responses session identity only when it was
     // carried in the body rather than an existing request header.
     // #2218/#1931: the plugin-protocol header x-bili-plugin-conversation is
@@ -2232,6 +2418,13 @@ export function isPreflightFailFast(outcome: Prepared | PreflightFailFast): outc
 // 30s protects every client whose header deadline exceeds 30s (undici's 300s
 // default included); shorter preflights keep full status-code fidelity.
 const PREFLIGHT_KEEPALIVE_MS = 15_000;
+// #2490/#3146: mathematically-doomed forward guard, priced in UTF-8 BYTES of the
+// core text against two bars — window×7.5 (densest live-route billing observed,
+// ~6.8 B/token, #2122) AND an absolute 2MB floor. Module-scoped so both the
+// estimate-only probe (#2313) and the fresh-session forward-once (#3146) share
+// the exact same doom math.
+const DOOMED_PROBE_BYTES_PER_TOKEN = 7.5;
+const DOOMED_PROBE_ABSOLUTE_BYTES = 2_000_000;
 
 function preflightHoldGraceMs(): number {
     return knobPreflightHoldGraceMs();
@@ -2716,8 +2909,6 @@ export async function preflightCompressIfNeeded(
         // are char-cheap (1 char ≈ 1 token already) but byte-doomed; every legit
         // fitting English payload sits ~4× under the ratio bar.
         const coreTextBytes = estimateCoreMessagesUpperBytes(prepared.processedMessages);
-        const DOOMED_PROBE_BYTES_PER_TOKEN = 7.5;
-        const DOOMED_PROBE_ABSOLUTE_BYTES = 2_000_000;
         if (coreTextBytes > Math.max(DOOMED_PROBE_ABSOLUTE_BYTES, limit * DOOMED_PROBE_BYTES_PER_TOKEN)) {
             const byteFloorTokens = Math.ceil(coreTextBytes / DOOMED_PROBE_BYTES_PER_TOKEN);
             const doomedMessage = `payload core text alone is ~${coreTextBytes} bytes — even at the densest tokenizer density observed on a live route (~${DOOMED_PROBE_BYTES_PER_TOKEN} bytes/token, #2122) that is ≥ ~${byteFloorTokens} tokens vs the model window ${limit} (model=${model}); no upstream can accept it, so it was NOT forwarded even for evidence. Remove or trim the oversized content (e.g. a giant paste or tool result) and retry.`;
@@ -2736,7 +2927,11 @@ export async function preflightCompressIfNeeded(
         log("info", `[${session.id}] preflight trigger fired on estimate only (~${Math.round(textChannel)} text + ~${imageTokens} image vs window ${limit}); baseline ${session.stats.lastInputTokens} (${session.stats.lastInputTokensSource ?? "unprovenanced"}) carries no current-route upstream evidence — forwarding once to acquire usage/overflow evidence before compressing (#2313)`);
         return prepared;
     }
-    const payloadFitsWindow = (unknownBaseline ? tokenCount : calibratedPayload) < limit;
+    // #3146: judge fit on the calibrated CJK-aware estimate for EVERY regime —
+    // the char-count bound (tokenCount) is the TRIGGER arm only. Judging fit on
+    // it made a fresh session whose real size fits the window read as over-window
+    // and fail-fast on the early no-compressible-ranges path below (#3146).
+    const payloadFitsWindow = calibratedPayload < limit;
     // #496 forward-once-then-learn: the default image cost (base64/4) matches byte
     // relays (#488) but overestimates pixel-tile upstreams (a 400KB JPEG ≈ 1.6K real
     // tokens, not ~133K), so an image-dominated payload can clear the window on ESTIMATE
@@ -2808,8 +3003,16 @@ export async function preflightCompressIfNeeded(
             upstreamEndpoint: ffEmbeddedUrl,
             knownKeys: ffProviderKeys,
         });
+        // #3146: when the size figure rests on bili's LOCAL estimate alone (no
+        // per-route calibration k̂, no usage/overflow-arm baseline), say so —
+        // presenting "~N tokens" as established fact misleads operators when the
+        // estimator diverges from upstream billing (#3146 read chars-as-tokens
+        // ~2x high). Rejections backed by real evidence keep today's wording.
+        const estimateOnly = baselineFloor === 0 && kFactor === undefined
+            && session.stats.lastInputTokensSource !== "usage" && session.stats.lastInputTokensSource !== "overflow-arm";
+        const estimateNote = estimateOnly ? " (size judged by bili's local estimate, which can diverge from what the upstream actually bills)" : "";
         const message =
-            `${sizeClause} (model=${model})${rangesClause} ` +
+            `${sizeClause} (model=${model})${rangesClause}${estimateNote} ` +
             `and preflight compression could not bring it under: ${detail.replace(/\.\s*$/, "")}.` +
             imageNote +
             shrinkNote +
@@ -2819,18 +3022,18 @@ export async function preflightCompressIfNeeded(
     };
     if ((prepared.nudge?.compressibleRanges ?? []).length === 0) {
         // Headroom or a stale baseline can trigger preflight on a fitting payload.
-        // Anonymous sessions need the conservative upper bound to prove that fit.
+        // #3146: fit is judged on the CJK-aware estimate (payloadFitsWindow) for
+        // every regime, so a fresh session whose real size fits forwards here.
         if (payloadFitsWindow) {
             log("info", `[${session.id}] preflight target reached (~${tokenCount}) but the payload fits with no compressible ranges (~${Math.round(calibratedPayload)}/${limit}${kFactor !== undefined ? `, k̂=${kFactor.toFixed(2)}` : ""}); forwarding as-is`);
             return prepared;
         }
-        if (unknownBaseline) {
-            return failFast(502, "no part of the conversation is compressible (nothing left to fold)", false);
-        }
-        // Known-baseline over-window: fall through to preflightCompress — its
-        // relax path (#330) folds the soft-protected recent zone when that is
-        // the only foldable content, and its exhaustion detail carries the
-        // operator remedy wording.
+        // Over-window with nothing foldable in the normal config: fall through to
+        // preflightCompress for EVERY regime — its relax path (#330) folds the
+        // soft-protected recent zone when that is the only foldable content, and
+        // if nothing folds the caller decides forward-once vs fail-fast on the
+        // payload's own estimate (#3146 replaces the old char-count fail-fast
+        // that rejected a fitting fresh session).
     }
     // #726: dead-end cooldown — an identical over-window state already failed
     // preflight without folding anything, so re-running the walk is doomed; fail
@@ -3072,6 +3275,29 @@ export async function preflightCompressIfNeeded(
             log("info", `[${session.id}] preflight folded ${result.compressedRanges} range(s) but images alone (~${imageTokens} tokens) keep the estimate over window ${limit} with no upstream overflow evidence — forwarding for the upstream to arbitrate billing (#496/#1800)`);
             return outbound;
         }
+    }
+    // #3146: a FRESH (unknown-baseline) session that still measures over-window
+    // by the calibrated CJK-aware estimate after maximum folding holds NO upstream
+    // evidence either way — the local estimate may undershoot (dense content) or
+    // overshoot, exactly like the estimate-only meter the #2313 probe refuses to
+    // trust. Forward once and let the upstream arbitrate the size (the #496/#1839/
+    // #2313 house pattern): success settles a usage baseline, a 4xx overflow arms
+    // one (armOverflowShrink), and honest metering + fail-fast resume from the next
+    // request. A mathematically-doomed body (#2490 byte math on the POST-FOLD
+    // payload) fails fast with 413 instead of burning a multi-MB guaranteed-400
+    // forward. This replaces the old char-count reject-forward gate, which
+    // fail-fasted a successfully-folded payload that actually fit (#3146).
+    if (unknownBaseline && !growthArmed) {
+        const outMsgs = outbound.processedMessages.length > 0 ? outbound.processedMessages : outbound.originalMessages;
+        const doomBytes = estimateCoreMessagesUpperBytes(outMsgs);
+        if (doomBytes > Math.max(DOOMED_PROBE_ABSOLUTE_BYTES, limit * DOOMED_PROBE_BYTES_PER_TOKEN)) {
+            const byteFloorTokens = Math.ceil(doomBytes / DOOMED_PROBE_BYTES_PER_TOKEN);
+            const doomedMessage = `payload core text alone is ~${doomBytes} bytes even after preflight compression — at the densest tokenizer density observed on a live route (~${DOOMED_PROBE_BYTES_PER_TOKEN} bytes/token, #2122) that is ≥ ~${byteFloorTokens} tokens vs the model window ${limit} (model=${model}); no upstream can accept it. Remove or trim the oversized content (e.g. a giant paste or tool result) and retry.`;
+            log("error", `[${session.id}] preflight fail-fast 413 (retryable=false): ${doomedMessage}`);
+            return { failFast: true, status: 413, message: doomedMessage, retryable: false, respond: !res.writableEnded };
+        }
+        log("info", `[${session.id}] fresh-session payload still over window ${limit} by local estimate (~${Math.round(result.payloadEstimate)} tok, ${result.compressedRanges} range(s) folded) with no upstream evidence — forwarding once for the upstream to arbitrate size before failing fast (#3146)`);
+        return outbound;
     }
     // The payload still overflows the window: fail fast with a diagnostic
     // error instead of forwarding a guaranteed-400 payload (#301).

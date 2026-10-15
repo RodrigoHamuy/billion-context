@@ -348,8 +348,10 @@ test("e2e: restart restores k̂ + usage anchor — the over-raw resend forwards 
         assert.equal(calls.filter((c) => c.stream).length, 4, "all four requests were forwarded as-is");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
         store.cancelAll();
         store2?.cancelAll();

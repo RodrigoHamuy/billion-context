@@ -95,8 +95,10 @@ async function startHarness(allowDshCompaction = false): Promise<{ proxyPort: nu
         captured,
         async close() {
             proxy.close();
+            proxy.closeIdleConnections?.();
             await once(proxy, "close");
             upstream.close();
+            upstream.closeIdleConnections?.();
             await once(upstream, "close");
         },
     };

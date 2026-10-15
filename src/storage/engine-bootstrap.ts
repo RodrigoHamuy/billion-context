@@ -26,16 +26,16 @@
  */
 
 import { createHash, randomBytes } from "node:crypto";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { promises as fsp } from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
 import { gunzipSync } from "node:zlib";
 import { log as loggerLog } from "../logger.js";
 import { cacheDir } from "../paths.js";
-import { loadConfigFile } from "../config.js";
+
 import { probeBuiltinSqlite, probeHostBetterSqlite3, registerSelfDownloadedBetterSqlite3, type BetterSqlite3Ctor } from "./driver.js";
-import { resolveStorageMode, resolveSqliteAutoDownload, updateRegistryBase } from "../knobs.js";
+import { fileStorageAutoDownload, fileStorageUnified, resolveStorageMode, resolveSqliteAutoDownload, updateRegistryBase } from "../knobs.js";
 import { normalizeRegistryBase } from "../update.js";
 import { proxyDispatcher } from "../upstream-proxy.js";
 
@@ -59,7 +59,7 @@ const SUPPORTED_TARGETS = [
 ];
 
 const BOOTSTRAP_TIMEOUT_MS = 10_000;
-const COOLDOWN_MS = 6 * 60 * 60 * 1000;
+export const COOLDOWN_MS = 6 * 60 * 60 * 1000;
 
 type BootstrapStatus =
     | "not-needed"
@@ -128,9 +128,23 @@ function cooldownFile(): string {
     return path.join(cacheRoot(), ".bootstrap-failed.json");
 }
 
-interface CooldownMarker {
+export interface CooldownMarker {
     atMs: number;
     reason: string;
+}
+
+/** Sync read of the failure marker for status surfaces (#3040): same file and
+ *  shape validation as readCooldown, but synchronous so the web endpoints can
+ *  report remaining cooldown without awaiting. */
+export function readBootstrapFailureMarker(): CooldownMarker | null {
+    try {
+        const raw = readFileSync(cooldownFile(), "utf8");
+        const j = JSON.parse(raw) as Partial<CooldownMarker>;
+        if (typeof j.atMs === "number" && typeof j.reason === "string") return { atMs: j.atMs, reason: j.reason };
+        return null;
+    } catch {
+        return null; // corrupt/absent marker: fail open toward retrying
+    }
 }
 
 async function readCooldown(): Promise<CooldownMarker | null> {
@@ -165,24 +179,6 @@ function cacheUsable(dir: string, target: string): boolean {
         && existsSync(path.join(dir, "prebuilds", `${target}.node`));
 }
 
-function fileStorageUnifiedValue(): string | undefined {
-    try {
-        const section = (loadConfigFile() as { storage?: { unified?: unknown } }).storage;
-        return typeof section?.unified === "string" ? section.unified : undefined;
-    } catch {
-        return undefined;
-    }
-}
-
-function fileSqliteAutoDownloadValue(): boolean | undefined {
-    try {
-        const v = (loadConfigFile() as { storage?: { sqliteAutoDownload?: unknown } }).storage?.sqliteAutoDownload;
-        return typeof v === "boolean" ? v : undefined;
-    } catch {
-        return undefined;
-    }
-}
-
 interface EnsureSqliteEngineOptions {
     /** Egress proxy resolver (same chain as updater/model traffic, #609). Absent = direct. */
     resolveProxy?: (url: string) => string | undefined;
@@ -199,7 +195,7 @@ export function ensureSqliteEngine(opts: EnsureSqliteEngineOptions = {}): Promis
 
 async function runBootstrap(opts: EnsureSqliteEngineOptions): Promise<BootstrapOutcome> {
     const env = opts.env ?? process.env;
-    if (resolveStorageMode(env, fileStorageUnifiedValue()) === "legacy") {
+    if (resolveStorageMode(env, fileStorageUnified()) === "legacy") {
         return { status: "not-needed", detail: "unified storage disabled" };
     }
     if (probeBuiltinSqlite()) {
@@ -222,7 +218,7 @@ async function runBootstrap(opts: EnsureSqliteEngineOptions): Promise<BootstrapO
     if (!SUPPORTED_TARGETS.includes(target)) {
         return { status: "unsupported-platform", detail: target };
     }
-    if (!resolveSqliteAutoDownload(env, fileSqliteAutoDownloadValue())) {
+    if (!resolveSqliteAutoDownload(env, fileStorageAutoDownload())) {
         return { status: "disabled", detail: "storage.sqliteAutoDownload=false" };
     }
     const cd = await readCooldown();

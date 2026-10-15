@@ -246,7 +246,11 @@ export interface RequestOptions {
 type RoundPart =
     | { kind: "reasoning"; text: string; signature: string }
     | { kind: "text"; text: string }
-    | { kind: "redacted"; data: string };
+    | { kind: "redacted"; data: string }
+    // #3158: a Gemini part whose only payload is a thoughtSignature (no text,
+    // no functionCall). Recorded in stream order so a proxy-tool rebuild puts
+    // it back on the re-request at its position.
+    | { kind: "standalone_signature"; signature: string };
 
 export type ParsedStreamEvent =
     | { kind: "text"; delta: string; raw?: Buffer }
@@ -256,6 +260,11 @@ export type ParsedStreamEvent =
     // on re-request — Anthropic rejects modified thinking-family blocks — so
     // it is its own event instead of riding the (empty) reasoning seal.
     | { kind: "redacted_thinking"; data: string }
+    // #3158: a Gemini part carrying ONLY a thoughtSignature (no text, no
+    // functionCall). The adapter forwards it to the client itself; the loop
+    // records it so a proxy-tool rebuild carries it back on the re-request —
+    // dropped there, the rebuilt history loses the signature association.
+    | { kind: "standalone_signature"; signature: string }
     | { kind: "tool_call"; name: string; callId: string; arguments: string; passthrough?: boolean; signature?: string }
     | { kind: "usage"; inputTokens?: number; outputTokens?: number; cachedTokens?: number; creationTokens?: number }
     // #1766: keys on the upstream terminal frame that bili does not model
@@ -724,6 +733,8 @@ export async function* runCompressLoop(
                         }
                     } else if (ev.kind === "redacted_thinking") {
                         roundParts.push({ kind: "redacted", data: ev.data });
+                    } else if (ev.kind === "standalone_signature") {
+                        roundParts.push({ kind: "standalone_signature", signature: ev.signature });
                     } else if (ev.kind === "tool_call") {
                         calls.push({ name: ev.name, callId: ev.callId, arguments: ev.arguments, passthrough: ev.passthrough, signature: ev.signature });
                     } else if (ev.kind === "usage") {
@@ -1148,6 +1159,7 @@ export async function* runCompressLoop(
                 let reasoningIdx = 0;
                 let textIdx = 0;
                 let redactedIdx = 0;
+                let sigIdx = 0;
                 for (const part of roundParts) {
                     if (part.kind === "reasoning") {
                         if (part.text.length === 0 || (requiresThinkingSignature && part.signature.length === 0)) continue;
@@ -1174,6 +1186,22 @@ export async function* runCompressLoop(
                             contentType: "text",
                             text: part.text,
                         });
+                    } else if (part.kind === "standalone_signature") {
+                        // #3158: put the standalone thoughtSignature back at its
+                        // stream position. rawGoogleParts is required: contentParts
+                        // returns the raw verbatim only when it can prove the raw's
+                        // texts equal the core's text, and an empty-text core with
+                        // no raw would serialize to zero parts — content vanishes.
+                        sigIdx += 1;
+                        const sigMsg: BiliMessage = {
+                            id: sigIdx === 1 ? `acp_loop_r${round}_asst_sig` : `acp_loop_r${round}_asst_sig_${sigIdx}`,
+                            role: "assistant",
+                            contentType: "text",
+                            text: "",
+                            googleThoughtSignature: part.signature,
+                            rawGoogleParts: [{ thoughtSignature: part.signature }],
+                        };
+                        coreMessages.push(sigMsg);
                     } else {
                         // #1960: byte-exact, position-exact replay of the opaque
                         // block; coreToAnthropic re-emits rawAnthropicBlock verbatim.
@@ -1240,7 +1268,7 @@ export async function* runCompressLoop(
                     (pr) => (pr.name === "compress" || pr.name === "decompress") && pr.result.includes("FAILED"),
                 );
                 if (!ctx.textProtocol && !anyCompressFailed) {
-                    const hidden = hideConsumedCompressCalls(ctx.session.state, coreMessages);
+                    const hidden = hideConsumedCompressCalls(ctx.session.state, coreMessages, ctx.config.isCompressTool);
                     if (hidden.hidden > 0) {
                         ctx.log(`[acp-loop] round ${round} hideConsumed hid ${hidden.hidden} compress record(s)`);
                         coreMessages.length = 0;

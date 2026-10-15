@@ -68,6 +68,7 @@ async function runLengthBudget(opts: { fillerRepeats: number; summaryText: strin
         return { result, session, bodies, logs };
     } finally {
         server.close();
+        server.closeIdleConnections?.();
         await once(server, "close");
     }
 }

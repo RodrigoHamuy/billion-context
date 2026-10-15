@@ -117,8 +117,10 @@ async function forwardedTurn2Length(sessionId: string, extraHeaders: Record<stri
         return (received[1] ?? []).length;
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 }

@@ -23,6 +23,7 @@ import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { flushAllSessions, _resetSessionsForTest } from "../src/session.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
+import { configureLogger, closeLogger } from "../src/logger.ts";
 import { rmrf } from "./tmp-rm.ts";
 
 export type Wire = "responses" | "chat" | "anthropic" | "google";
@@ -379,12 +380,35 @@ function goldenProxyOptions(upstreamPort: number, ctx: number): ProxyOptions {
  *  store, reset the session pool, optionally drop the legacy file
  *  ("dropFile" — the unified index must be self-sufficient), then continue
  *  the conversation through a fresh SessionStore. */
+// Scratch root for drive runs (#3147-B): workspace-local + gitignored, NOT
+// os.tmpdir(). On Windows hosted runners %TEMP% is an AV/indexer hot path
+// AND is shared by all c=4 test legs, so external locks on the golden tree
+// have repeatedly outlasted the rmrf retry budget (~9.8s, #2908 family) and
+// false-red'd the leg in cleanup. A cwd-relative dir sees none of that.
+const SCRATCH_ROOT = path.resolve(process.cwd(), "tmp", "golden-drive");
+
+/** Best-effort sweep of scratch dirs left by an aborted earlier run (> 6h
+ *  old). Never touches live dirs, never throws. */
+function sweepStaleScratch(): void {
+    try {
+        const cutoff = Date.now() - 6 * 60 * 60 * 1000;
+        for (const entry of fs.readdirSync(SCRATCH_ROOT)) {
+            const p = path.join(SCRATCH_ROOT, entry);
+            try {
+                if (fs.statSync(p).mtimeMs < cutoff) fs.rmSync(p, { recursive: true, force: true });
+            } catch { /* locked or already gone — leave it */ }
+        }
+    } catch { /* root absent — nothing to sweep */ }
+}
+sweepStaleScratch();
+
 export async function driveWire(wire: Wire, sessionId = `golden-${wire}`, opts: {
     dumpStateTo?: string;
     storageUnified?: "shadow" | "full";
     reloadAfterEdit?: "keepFile" | "dropFile";
 } = {}): Promise<GoldenRecord> {
-    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), `golden-${wire}-`));
+    fs.mkdirSync(SCRATCH_ROOT, { recursive: true });
+    const tmp = fs.mkdtempSync(path.join(SCRATCH_ROOT, `${wire}-`));
     const sessionsDir = path.join(tmp, "sessions");
     const prevXdg = process.env.XDG_STATE_HOME;
     const prevUnified = process.env.BILI_STORAGE_UNIFIED;
@@ -499,12 +523,26 @@ export async function driveWire(wire: Wire, sessionId = `golden-${wire}`, opts: 
         await flushAllSessions();
         const session = store.loadSync(sessionId);
         if (!session) throw new Error(`${wire}: session not persisted`);
-        const lastView = JSON.stringify(canonicalize({
+        // #3113: pin logical content, not serialization order. canonicalize()
+        // is shared runtime code (src/storage/canonical.ts) and keeps insertion
+        // order, so a harmless field-reorder commit (#3093) red all four
+        // goldens. Deep-sort object keys harness-side only; array order is
+        // preserved (foldAnchorOrder & co are ordered contracts).
+        const sortObjectKeys = (v: unknown): unknown => {
+            if (Array.isArray(v)) return v.map(sortObjectKeys);
+            if (v && typeof v === "object") {
+                const o: Record<string, unknown> = {};
+                for (const k of Object.keys(v as Record<string, unknown>).sort()) o[k] = sortObjectKeys((v as Record<string, unknown>)[k]);
+                return o;
+            }
+            return v;
+        };
+        const lastView = JSON.stringify(canonicalize(sortObjectKeys({
             state: session.state,
             blockContents: [...session.blockContents.entries()],
             stats: session.stats,
             metadata: session.metadata,
-        }))
+        })))
             // Ephemeral environment, not contract: the judge upstream's
             // ephemeral port and this drive's session id appear inside ledger
             // lines / stats origins. Normalize before hashing.
@@ -516,7 +554,7 @@ export async function driveWire(wire: Wire, sessionId = `golden-${wire}`, opts: 
         // CI failure message pinpoints the divergent subtree without needing
         // the golden to carry the full view.
         const norm = (v: unknown) =>
-            (JSON.stringify(canonicalize(v)) ?? "null")
+            (JSON.stringify(canonicalize(sortObjectKeys(v))) ?? "null")
                 .replace(/127\.0\.0\.1:\d+/g, "127.0.0.1:<PORT>")
                 .split(JSON.stringify(sessionId).slice(1, -1)).join("<SID>");
         const sectionDigests = {
@@ -558,6 +596,26 @@ export async function driveWire(wire: Wire, sessionId = `golden-${wire}`, opts: 
         else process.env.XDG_STATE_HOME = prevXdg;
         if (prevUnified === undefined) delete process.env.BILI_STORAGE_UNIFIED;
         else process.env.BILI_STORAGE_UNIFIED = prevUnified;
-        rmrf(tmp);
+        // Kill the in-process re-creators BEFORE rmrf (#3147-B root cause):
+        // startServer configures the tee logger unconditionally and its file
+        // stream targets tmp/billion-context/bili.log for the process life —
+        // after deletion any later log line makes getStream() detect the
+        // orphaned inode and REOPEN the deleted path, resurrecting the tree
+        // mid-rmrf (the #1646/#1910 ENOTEMPTY/EBUSY race class). The detach
+        // + target-clear below are synchronous, so no interleaving window.
+        // The 1ms-debounced store writer races the same way (recreating
+        // sessions/<provider>/ after the final flush).
+        try { store?.cancelAll(); } catch { /* no store on early-exit paths */ }
+        void closeLogger();
+        configureLogger("off");
+        // Cleanup is best-effort (#3147-B): every assertion has already run by
+        // now, so an external lock outlasting the rmrf ladder must not turn a
+        // green run red. Leftovers are inert gitignored scratch — the next
+        // process importing this module sweeps ones > 6h old.
+        try {
+            rmrf(tmp);
+        } catch (err) {
+            console.warn(`[golden-storage-drive] leftover scratch ${tmp} (cleanup failed: ${(err as Error).message})`);
+        }
     }
 }

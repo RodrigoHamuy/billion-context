@@ -1,5 +1,6 @@
 import { clampPrefix } from "./truncate.js";
 import { BLOCKED_REF } from "./refs.js";
+import { COMPRESS_TOOL_NAME } from "./compress-tools.js";
 import type { CompressionState, CoreMessage } from "./types.js";
 
 // Orphaned compress calls (no matching block — failed attempts, or historical
@@ -68,6 +69,33 @@ function parseCallText(text: string | undefined): ParsedCallText | null {
   }
   if (!content || content.length === 0) return null;
   return { prefix: raw.slice(0, start), obj, content, contentWasString };
+}
+
+// Range keys a compress call's args quote, using the same startId/endId
+// (messageId fallback) extraction as rewriteCompressText so identity-by-range
+// resolves against exactly what the live-range compaction compares.
+function quotedRangeKeys(text: string | undefined): Set<string> {
+  const parsed = parseCallText(text);
+  if (!parsed) return new Set<string>();
+  const out = new Set<string>();
+  for (const entry of parsed.content) {
+    if (!entry || typeof entry !== "object") continue;
+    const e = entry as Record<string, unknown>;
+    const s =
+      typeof e.startId === "string"
+        ? e.startId
+        : typeof e.messageId === "string"
+          ? e.messageId
+          : "";
+    const end =
+      typeof e.endId === "string"
+        ? e.endId
+        : typeof e.messageId === "string"
+          ? e.messageId
+          : "";
+    if (s && end) out.add(rangeKey(s, end));
+  }
+  return out;
 }
 
 function rewriteCompressText(
@@ -150,20 +178,32 @@ function compactCompressText(text: string | undefined): string | null {
 export function hideConsumedCompressCalls(
   state: CompressionState,
   messages: CoreMessage[],
+  isCompressTool: (toolName: string) => boolean = (name) =>
+    name === COMPRESS_TOOL_NAME,
 ): HideConsumedResult {
   const allBlockCallIds = new Set<string>();
   const activeCallIds = new Set<string>();
   const liveRangeKeysByCallId = new Map<string, Set<string>>();
   const legacyLiveByCallId = new Set<string>();
+  // Range keys over ALL blocks / ACTIVE blocks only — identity-by-range for
+  // foreign-name carriers whose synthetic block id never equals the re-sent
+  // host call id (#2970). Only consulted for non-bare-name calls, so the
+  // proxy / in-process path is untouched.
+  const anyBlockRangeKeys = new Set<string>();
+  const activeRangeKeys = new Set<string>();
   for (const block of state.blocks) {
     if (!block.compressCallId) continue;
     allBlockCallIds.add(block.compressCallId);
+    if (block.startRef !== undefined && block.endRef !== undefined) {
+      anyBlockRangeKeys.add(rangeKey(block.startRef, block.endRef));
+    }
     if (!block.active) continue;
     activeCallIds.add(block.compressCallId);
     if (block.startRef === undefined || block.endRef === undefined) {
       legacyLiveByCallId.add(block.compressCallId);
       continue;
     }
+    activeRangeKeys.add(rangeKey(block.startRef, block.endRef));
     let keys = liveRangeKeysByCallId.get(block.compressCallId);
     if (!keys) {
       keys = new Set<string>();
@@ -172,51 +212,89 @@ export function hideConsumedCompressCalls(
     keys.add(rangeKey(block.startRef, block.endRef));
   }
 
-  const lastOrphanedCallIds: string[] = [];
+  type Fate = "active" | "inactive" | "orphan";
+  const resolveFate = (message: CoreMessage): Fate => {
+    const id = message.toolCallId;
+    if (id && activeCallIds.has(id)) return "active";
+    if (id && allBlockCallIds.has(id)) return "inactive";
+    // Foreign-name carriers resolve by the range they quote (their block's
+    // startRef/endRef). Bare-name is always id-matched, so this branch is
+    // unreachable for it — stated explicitly so it cannot drift onto that path.
+    if (!id || message.toolName === COMPRESS_TOOL_NAME) return "orphan";
+    const quoted = quotedRangeKeys(message.text);
+    for (const k of quoted) if (activeRangeKeys.has(k)) return "active";
+    for (const k of quoted) if (anyBlockRangeKeys.has(k)) return "inactive";
+    return "orphan";
+  };
+
+  const infos: { isCompressCall: boolean; fate: Fate }[] = messages.map(
+    (message) => {
+      const isCompressCall =
+        !!message.toolName &&
+        isCompressTool(message.toolName) &&
+        message.contentType === "tool-call";
+      return {
+        isCompressCall,
+        fate: isCompressCall ? resolveFate(message) : "orphan",
+      };
+    },
+  );
+
+  const lastOrphaned = new Set<string>();
   for (
     let i = messages.length - 1;
-    i >= 0 && lastOrphanedCallIds.length < KEEP_LAST_ORPHANED;
+    i >= 0 && lastOrphaned.size < KEEP_LAST_ORPHANED;
     i--
   ) {
-    const message = messages[i]!;
-    if (message.toolName !== "compress" || message.contentType !== "tool-call")
-      continue;
-    const callId = message.toolCallId;
-    if (callId && !allBlockCallIds.has(callId)) {
-      lastOrphanedCallIds.push(callId);
+    const info = infos[i]!;
+    const callId = messages[i]!.toolCallId;
+    if (info.isCompressCall && callId && info.fate === "orphan") {
+      lastOrphaned.add(callId);
     }
   }
 
-  const keepCallIds = new Set([...activeCallIds, ...lastOrphanedCallIds]);
-
+  const keepCallIds = new Set<string>();
   const hiddenCallIds = new Set<string>();
-  for (const message of messages) {
+  for (let i = 0; i < messages.length; i++) {
+    const info = infos[i]!;
+    const callId = messages[i]!.toolCallId;
+    if (!info.isCompressCall || !callId) continue;
     if (
-      message.toolName === "compress" &&
-      message.contentType === "tool-call" &&
-      (!message.toolCallId || !keepCallIds.has(message.toolCallId))
+      info.fate === "inactive" ||
+      (info.fate === "orphan" && !lastOrphaned.has(callId))
     ) {
-      if (message.toolCallId) hiddenCallIds.add(message.toolCallId);
+      hiddenCallIds.add(callId);
+    } else {
+      keepCallIds.add(callId);
     }
+  }
+
+  const fateByCallId = new Map<string, Fate>();
+  for (let i = 0; i < messages.length; i++) {
+    const info = infos[i]!;
+    const callId = messages[i]!.toolCallId;
+    if (info.isCompressCall && callId) fateByCallId.set(callId, info.fate);
   }
 
   let hidden = 0;
   const hiddenOrphanRefs: string[] = [];
   const rememberHiddenRef = (message: CoreMessage): void => {
-    if (message.toolCallId && allBlockCallIds.has(message.toolCallId)) {
-      return;
-    }
+    const fate = message.toolCallId
+      ? fateByCallId.get(message.toolCallId)
+      : undefined;
+    if (fate !== "orphan") return;
     const ref = state.messageRefs.byRaw[message.id];
     if (ref && ref !== BLOCKED_REF && !hiddenOrphanRefs.includes(ref)) {
       hiddenOrphanRefs.push(ref);
     }
   };
   const result: CoreMessage[] = [];
-  for (const message of messages) {
+  for (let i = 0; i < messages.length; i++) {
+    const message = messages[i]!;
+    const info = infos[i]!;
     if (
-      message.toolName === "compress" &&
-      message.contentType === "tool-call" &&
-      (!message.toolCallId || !keepCallIds.has(message.toolCallId))
+      info.isCompressCall &&
+      (!message.toolCallId || hiddenCallIds.has(message.toolCallId))
     ) {
       hidden++;
       rememberHiddenRef(message);
@@ -232,12 +310,25 @@ export function hideConsumedCompressCalls(
       continue;
     }
     if (
-      message.toolName === "compress" &&
-      message.contentType === "tool-call" &&
+      info.isCompressCall &&
       message.toolCallId &&
       keepCallIds.has(message.toolCallId)
     ) {
-      const liveKeys = liveRangeKeysByCallId.get(message.toolCallId);
+      let liveKeys = liveRangeKeysByCallId.get(message.toolCallId);
+      if (
+        !liveKeys &&
+        !legacyLiveByCallId.has(message.toolCallId) &&
+        message.toolName !== COMPRESS_TOOL_NAME
+      ) {
+        // Foreign-name carrier: derive live ranges from what it quotes (its own
+        // block's active ranges) — the by-callId index is keyed on the synthetic
+        // block id, not the host call id.
+        const derived = new Set<string>();
+        for (const k of quotedRangeKeys(message.text)) {
+          if (activeRangeKeys.has(k)) derived.add(k);
+        }
+        liveKeys = derived;
+      }
       if (
         liveKeys &&
         liveKeys.size > 0 &&

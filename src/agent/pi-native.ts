@@ -24,6 +24,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST } from "../launcher.js";
+import { piPackageStrings } from "../plugin-install.js";
 import { createBiliPlugin } from "./pi.js";
 import { isLegacyBcpEntry, markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, setNativeOriginWaiter, singleFlight } from "./native-bootstrap.js";
 import { installNativeFetchIntercept, noteRoutedOrigin, observeRoutedOrigin, readyOrigin, type NativeInterceptState } from "./native-intercept.js";
@@ -70,8 +71,9 @@ export function legacyBcpEntriesIn(file: string): string[] {
     }
     try {
         const parsed = JSON.parse(text) as { packages?: unknown };
-        if (!Array.isArray(parsed.packages)) return [];
-        return (parsed.packages as unknown[]).map(String).filter(isLegacyBcpEntry);
+        // #3131: string specs only — object entries ({source: "…"}) stringify
+        // to "[object Object]" and can never match.
+        return piPackageStrings(parsed.packages).filter(isLegacyBcpEntry);
     } catch {
         return [];
     }

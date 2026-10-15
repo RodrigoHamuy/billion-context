@@ -158,10 +158,13 @@ test("#2678: several preflight ranges fold in ONE external-summary batch that ru
         assert.ok(activeBlocks.length >= 2, `the batch must apply several ranges before re-judging (got ${activeBlocks.length} block(s))`);
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         main.server.close();
+        main.server.closeIdleConnections?.();
         await once(main.server, "close");
         sum.server.close();
+        sum.server.closeIdleConnections?.();
         await once(sum.server, "close");
     }
 });
@@ -192,10 +195,13 @@ test("#2678: a batch-failed range is retried across later rounds instead of drop
         assert.ok(failedAttempts >= 2, `the failed range must be retried beyond its batch attempt (got ${failedAttempts} attempt(s))`);
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         main.server.close();
+        main.server.closeIdleConnections?.();
         await once(main.server, "close");
         sum.server.close();
+        sum.server.closeIdleConnections?.();
         await once(sum.server, "close");
     }
 });
@@ -246,10 +252,13 @@ test("#2678: nomination picks the oldest chunk of a multi-chunk range without po
         assert.ok(activeBlocks.length >= 5, `the multi-chunk range must keep folding chunk by chunk (got ${activeBlocks.length} block(s))`);
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         main.server.close();
+        main.server.closeIdleConnections?.();
         await once(main.server, "close");
         sum.server.close();
+        sum.server.closeIdleConnections?.();
         await once(sum.server, "close");
     }
 });
@@ -277,10 +286,13 @@ test("#2678: a batch-failed range is retried in later rounds while siblings keep
         assert.ok(failedAttempts >= 3, `the failed range must be retried across multiple rounds (got ${failedAttempts} attempt(s))`);
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         main.server.close();
+        main.server.closeIdleConnections?.();
         await once(main.server, "close");
         sum.server.close();
+        sum.server.closeIdleConnections?.();
         await once(sum.server, "close");
     }
 });

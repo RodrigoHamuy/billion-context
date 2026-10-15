@@ -25,6 +25,7 @@ import { stateDir } from "./paths.js";
 import { loadConfigFile } from "./config.js";
 import { UPSTREAM_TIMEOUT_MS, REPLAY_MAX_ATTEMPTS, REPLAY_BASE_DELAY_MS } from "./fetch-util.js";
 import { PROXY_KEEPALIVE_MAX_MS } from "./upstream-proxy.js";
+import { WAL_JOURNAL_SIZE_LIMIT } from "./storage/schema.js";
 
 /** Tiered raw number: the env var wins when SET (even empty/garbage — the
  *  caller applies the historical validation), else a finite number from the
@@ -227,11 +228,14 @@ export function maxSessions(): number {
     return Math.max(1, v || 256);
 }
 
-/** BILI_SESSION_WARM_MAX > sessions.warmMax > 8 (#2803 bounded startup: how many
- *  most-recently-saved sessions boot hydrates before listening; 0 warms none). */
+/** BILI_SESSION_WARM_MAX > sessions.warmMax > 0 (#2803 bounded startup, #3050 R3 ②-0:
+ *  how many most-recently-saved sessions boot hydrates before listening; 0 warms none.
+ *  Default 0 — measured -151 MB RSS at boot with no traffic-facing cost: an un-warmed
+ *  session pays one on-demand load (file read or unified lookup) on first touch
+ *  instead. Set 8 to restore the #2803 eager warm set.) */
 export function sessionWarmMax(): number {
     const v = tInt("BILI_SESSION_WARM_MAX", loadConfigFile().sessions?.warmMax);
-    return Number.isFinite(v) && v >= 0 ? Math.floor(v) : 8;
+    return Number.isFinite(v) && v >= 0 ? Math.floor(v) : 0;
 }
 
 /** BILI_SESSION_WARM_MAX_BYTES > sessions.warmMaxBytes > 64 MiB (#2803 decoded-byte
@@ -477,6 +481,29 @@ export function fakeBufCapBytes(): number {
     return Number.isFinite(v) && v > 0 ? v : 16 * 1024 * 1024;
 }
 
+/** Config-file tiers of the storage knobs (#3040): single readers so the
+ *  runtime-status surface and the store constructor report exactly what the
+ *  file says (moved out of persist.ts, which used to be the only home). */
+export function fileStorageUnified(): string | undefined {
+    const v = loadConfigFile().storage?.unified;
+    return typeof v === "string" ? v : undefined;
+}
+
+export function fileStorageJsonWriter(): string | undefined {
+    const v = loadConfigFile().storage?.jsonWriter;
+    return typeof v === "string" ? v : undefined;
+}
+
+export function fileStorageAutoDownload(): boolean | undefined {
+    const v = loadConfigFile().storage?.sqliteAutoDownload;
+    return typeof v === "boolean" ? v : undefined;
+}
+
+export function fileStorageWalJournalSizeLimit(): number | undefined {
+    const v = loadConfigFile().storage?.walJournalSizeLimitBytes;
+    return typeof v === "number" && Number.isInteger(v) && v > 0 ? v : undefined;
+}
+
 /** Tiered storage-migration switch (#2671): legacy | shadow | full. Lives here
  *  per the env-var discipline — env tier BILI_STORAGE_UNIFIED (1/true = shadow,
  *  full/unified = full, 0/false/legacy/garbage = legacy) wins over the
@@ -529,4 +556,20 @@ export function resolveSqliteAutoDownload(env: NodeJS.ProcessEnv = process.env, 
     if (raw === "1" || raw === "true") return true;
     if (raw === "0" || raw === "false") return false;
     return typeof fileValue === "boolean" ? fileValue : true;
+}
+
+/** #3250 WAL reclamation cap in bytes. Env
+ *  BILI_STORAGE_WAL_JOURNAL_SIZE_LIMIT_BYTES (positive integer) wins over the
+ *  config-file `storage.walJournalSizeLimitBytes`; a garbage/non-positive env
+ *  value falls through to the file/default tier (same discipline as
+ *  resolveSqliteAutoDownload — never crash boot on a typo'd knob). Pure:
+ *  env + file value in, bytes out (never throws). */
+export function resolveStorageWalJournalSizeLimit(env: NodeJS.ProcessEnv = process.env, fileValue?: number): number {
+    const raw = env.BILI_STORAGE_WAL_JOURNAL_SIZE_LIMIT_BYTES?.trim();
+    if (raw) {
+        const n = Number(raw);
+        if (Number.isInteger(n) && n > 0) return n;
+    }
+    if (typeof fileValue === "number" && Number.isInteger(fileValue) && fileValue > 0) return fileValue;
+    return WAL_JOURNAL_SIZE_LIMIT;
 }

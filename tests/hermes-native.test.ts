@@ -436,6 +436,49 @@ elif SCENARIO == "no-sidecar":
 elif SCENARIO == "spawn-fail":
     install_sidecar(True)
     mod.register(ctx)
+elif SCENARIO.startswith("attach-window"):
+    # #3261: the host knows the model window (context_length_cache.yaml) — verify it now
+    # rides both report channels; the ambiguous leg pins "no guess" on conflicting entries.
+    install_sidecar(False)
+    os.environ["BILLION_CONTEXT_ATTACH"] = ORIGIN
+    ca_dir = os.path.join(os.environ["XDG_DATA_HOME"], "billion-context", "ca")
+    os.makedirs(ca_dir, exist_ok=True)
+    with open(os.path.join(ca_dir, "root-ca.pem"), "w") as f:
+        f.write("dummy-ca\n")
+    with open(os.path.join(ca_dir, "combined-ca.pem"), "w") as f:
+        f.write("dummy-combined-ca\n")
+    try:
+        mod._yaml_loader()
+        out["yaml_ok"] = True
+    except Exception:
+        out["yaml_ok"] = False
+    home = os.environ["HERMES_HOME"]
+    if SCENARIO == "attach-window":
+        with open(os.path.join(home, "context_length_cache.yaml"), "w") as f:
+            f.write("group/sol@http://127.0.0.1:3425/v1: 500000\n"
+                    "unrelated@https://other.example/v1: 123456\n")
+        with open(os.path.join(home, "config.yaml"), "w") as f:
+            f.write("providers:\n  solprov:\n    base_url: http://127.0.0.1:3425\n")
+        win_model, win_provider = "group/sol", "solprov"
+    else:
+        with open(os.path.join(home, "context_length_cache.yaml"), "w") as f:
+            f.write("amb@http://a.example/v1: 100000\n"
+                    "amb@http://b.example/v1: 200000\n")
+        win_model, win_provider = "amb", "solprov"
+    mod.register(ctx)
+    mw = ctx.middlewares.get("llm_request")
+    hook = ctx.hooks.get("pre_api_request")
+    req = {"model": win_model, "max_tokens": 100}
+    frozen = json.loads(json.dumps(req))
+    first = mw(request=req, original_request=frozen, session_id="sess-w", model=win_model, provider=win_provider, api_mode="chat")
+    hook(session_id="sess-w", model=win_model, max_tokens=4096)
+    deadline = __import__("time").monotonic() + 3.0
+    while not RECORDED["runtime_info"] and __import__("time").monotonic() < deadline:
+        __import__("time").sleep(0.05)
+    out.update({
+        "req_unmutated": req == frozen,
+        "win_headers": first["request"]["extra_headers"] if isinstance(first, dict) else None,
+    })
 elif SCENARIO.startswith("attach"):
     install_sidecar(False)
     os.environ["BILLION_CONTEXT_ATTACH"] = ORIGIN
@@ -555,6 +598,8 @@ interface DriverOut {
     refused?: string[];
     instance_id?: string | null;
     spawn_env?: { lane?: string | null; token?: boolean; parent?: boolean } | null;
+    yaml_ok?: boolean;
+    win_headers?: Record<string, string> | null;
     round1_none?: boolean;
     req_unmutated?: boolean;
     first_headers?: Record<string, string> | null;
@@ -611,6 +656,7 @@ describe("python plugin runtime (subprocess)", () => {
         assert.equal(h1["x-bili-plugin-model"], "test-model");
         assert.equal(h1["X-Custom"], "keep");
         assert.equal(h1["x-bili-plugin-max-output"], undefined);
+        assert.equal(h1["x-bili-plugin-context-window"], undefined, "#3261 fail-open: no host cache file -> no window header");
         const h2 = out!.second_headers!;
         assert.equal(h2["x-bili-plugin-max-output"], "4096");
         assert.equal(out!.second_model_kept, "test-model");
@@ -632,6 +678,49 @@ describe("python plugin runtime (subprocess)", () => {
         // #1199: an attaching session registers its host pid so the shared proxy
         // outlives the first (spawning) owner's exit.
         assert.deepEqual(out!.watcher_calls, [{ pid: out!.pid }], "attached session registers its host pid as a watchdog owner");
+    });
+
+    // #3261: the host knows the model's window (HERMES_HOME/context_length_cache.yaml) but the
+    // plugin never carried it up — now stamped on the header channel AND reported in
+    // runtime-info. The header leg resolves the base URL via the provider entry in config.yaml
+    // (origin-granularity match: cache keeps /v1, config omits it); the hook leg runs WITHOUT
+    // a provider kwarg — the known minimum hook surface — so it must work off the unambiguous
+    // single-entry fallback.
+    test("attach-window: host context_length_cache.yaml window rides header + runtime-info (#3261)", () => {
+        if (!PY) {
+            console.warn("skip: no python3/python interpreter on this machine (hermes requires Python 3.11+)");
+            return;
+        }
+        const { out, err } = runDriver("attach-window");
+        assert.ok(out, err);
+        assert.equal(out!.env_https_proxy, out!.origin, "attached");
+        if (!out!.yaml_ok) {
+            console.warn("skip positive leg: no YAML backend on this host — the cache is unreadable and the feature fails open");
+            return;
+        }
+        const h = out!.win_headers!;
+        assert.equal(h["x-bili-plugin"], "hermes");
+        assert.equal(h["x-bili-plugin-conversation"], "sess-w");
+        assert.equal(h["x-bili-plugin-model"], "group/sol");
+        assert.equal(h["x-bili-plugin-context-window"], "500000", "header channel: the host's own window value");
+        assert.equal(out!.req_unmutated, true);
+        assert.deepEqual(out!.runtime_info, [
+            { agent: "hermes", model: "group/sol", maxOutput: 4096, contextWindow: 500000, source: "hermes-native" },
+        ]);
+    });
+
+    test("attach-window-ambiguous: conflicting per-upstream windows are not guessed (#3261)", () => {
+        if (!PY) {
+            console.warn("skip: no python3/python interpreter on this machine (hermes requires Python 3.11+)");
+            return;
+        }
+        const { out, err } = runDriver("attach-window-ambiguous");
+        assert.ok(out, err);
+        assert.equal(out!.env_https_proxy, out!.origin, "attached");
+        const h = out!.win_headers!;
+        assert.equal(h["x-bili-plugin"], "hermes");
+        assert.equal(h["x-bili-plugin-context-window"], undefined, "same model mapped to different windows per upstream -> no guess");
+        assert.deepEqual(out!.runtime_info, [{ agent: "hermes", model: "amb", maxOutput: 4096, source: "hermes-native" }]);
     });
 
     test("attach to a daemon proxy: 409 watcher refusal is silent and the session still starts", () => {

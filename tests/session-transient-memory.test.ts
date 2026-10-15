@@ -10,16 +10,27 @@ import { rememberPluginMessages, _rememberedForTest } from "../src/plugin.ts";
 import { createSession, getSession, dropSessionForGc, _resetSessionsForTest } from "../src/session.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 
-test("#2920 诊断副本保留 UTF-16 内容，结算只转移会话内引用", () => {
+test("#2920/#2868 诊断副本保留 UTF-8 内容，结算只转移会话内引用", () => {
     const session = createSession("transient-seam");
-    const body = JSON.stringify({ messages: [{ role: "user", content: "中😀" }] }) + "\ud800";
+    const body = JSON.stringify({ messages: [{ role: "user", content: "中😀" }] });
     noteForwardedBody(session, body);
     const sent = session.transient?.sentBody;
-    assert.equal(sent?.str, body);
-    assert.equal(sent?.full, body);
+    // #2868: slots retain the UTF-8 ENCODING of the body (bytes, not code
+    // units) — byte-equal here because the body is valid UTF-8.
+    assert.equal(sent?.head.toString("utf8"), body);
+    assert.equal(sent?.full?.toString("utf8"), body);
     settleUsageReport(session, { total: 1000, reportedCached: 0, output: 10, protocol: "openai", upstream: "http://synthetic" });
     assert.equal(session.transient?.sentBody, undefined);
     assert.equal(session.transient?.settledBody, sent);
+});
+
+test("#2868 孤立代理项无 UTF-8 形式，保留字节记录 U+FFFD", () => {
+    const session = createSession("surrogate-seam");
+    // A lone surrogate has no UTF-8 form: retained bytes carry the wire-visible
+    // replacement char, never a raw half-surrogate (#2868's unit is bytes).
+    noteForwardedBody(session, "a\ud800b");
+    const slot = session.transient?.sentBody;
+    assert.equal(slot?.head.toString("utf8"), "a\ufffdb");
 });
 
 test("#2920 派生缓存不落盘，淘汰后不能重新挂上工具快照", async () => {
@@ -136,7 +147,7 @@ test("#2920 完整诊断副本也不保留其截取前的大字符串", (t) => {
         console.log(JSON.stringify({ retained, released }));
     `);
     t.diagnostic(JSON.stringify(result));
-    // 完整 UTF-16 副本可能每字符两字节；上界仍远低于原始 96 MiB。
+    // #2868 后完整副本是 UTF-8：ASCII hex 语料每字符一字节（原 UTF-16 为二）；上界仍远低于原始 96 MiB。
     assert.ok(result.retained < 48 * 1024 * 1024, JSON.stringify(result));
     assert.ok((result.released ?? 0) > 12 * 1024 * 1024, JSON.stringify(result));
 });

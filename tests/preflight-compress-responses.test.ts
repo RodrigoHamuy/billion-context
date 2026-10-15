@@ -175,8 +175,10 @@ test("e2e #280 (Responses): restored session with lastInputTokens=0 → prefligh
         assert.equal(sB!.stats.lastInputTokens, 1000, "the real usage report lands after the recovered forward");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });

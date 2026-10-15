@@ -63,5 +63,24 @@ precisely so knobs don't bloat the environment. Precedence everywhere:
   `compress` hierarchy. `imageBilling`/`imageTokenCap`, which DO have
   provider/model tiers, remain in the providers table.
 - **Precedence contract pinned by test:** `tests/knobs-config-precedence.test.ts`
-  asserts env > file > default, set-garbage-env byte-exactness, and hot-reload
-  of the file tier.
+   asserts env > file > default, set-garbage-env byte-exactness, and hot-reload
+   of the file tier.
+
+## Test-infra escape hatches (scripts/-only, never product knobs)
+
+A small class of env vars exists purely for the local test harness — read by
+`scripts/*`, NEVER by `src/` or `src/knobs.ts`, and therefore NOT config-file
+knobs. They carry no provider/model dimension, are never shipped behavior, and
+stay OUT of CONFIGURATION.md (that surface is for user-facing knobs). They are
+documented HERE instead so the discipline ("document or don't ship") still
+holds without polluting the product config surface.
+
+| Var | Read by | Effect | Default |
+|-----|---------|--------|---------|
+| `BILI_TEST_FORCE` | `scripts/test-suite-lock.mjs` only | Set to `1`/`true`/`yes` to deliberately bypass the per-machine test-suite mutex (#3103) and let a second full `npm test` run share the machine with a live one. Untyped escape hatch for the known limitation the lock cannot cover (orphan daemons from a SIGKILLed suite, cross-clone contention); a normal single run never sets it. | unset = lock enforced |
+
+`BILI_TEST_FORCE` is the escape door the suite lock points at when a sibling
+run is detected (`[bili:test] a test suite is already running … to proceed
+anyway: BILI_TEST_FORCE=1 npm test`). Because it changes nothing about a
+single-run's behavior and is invisible to production code, it needs neither a
+config tier nor owner-gated config-surface review — only this one-line entry.

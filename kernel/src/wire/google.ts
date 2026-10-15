@@ -97,8 +97,9 @@ export function googleToCore(body: GoogleRequestBody): GoogleFlat {
     const parts = Array.isArray(content.parts) ? content.parts : [];
     const isModel = content.role === "model";
 
-    // 1. Tool results first: the rebuilt user content must lead with its
-    //    functionResponse parts.
+    // 1. Tool results first: their cores precede the content's own user core
+    //    (pairing order); the rebuild's PART order is normalized separately
+    //    (coreToGoogle / #3159).
     for (const part of parts) {
       const fr = part.functionResponse;
       if (!fr || typeof fr.name !== "string") continue;
@@ -211,13 +212,44 @@ export function googleToCore(body: GoogleRequestBody): GoogleFlat {
   return { msgs, systemText: googleSystemText(body) };
 }
 
+/** #3159 — Vertex rejects a request whose user content carries plain text
+ *  AFTER a functionResponse part ("Requests ending with a model turn are not
+ *  supported"); text-before-functionResponse is accepted (controlled A/B on
+ *  the official endpoint, gemini-4-argon). When a movable plain-text part
+ *  trails a functionResponse, stable-partition the unsigned non-thought plain
+ *  text ahead of every non-text part; otherwise return the input untouched so
+ *  already-safe shapes stay byte-identical (prefix-cache anchor). Signed text
+ *  parts, thought parts and all non-text parts keep their relative order —
+ *  nothing is dropped, renamed or rewritten. */
+export function normalizeGoogleUserPartOrder(parts: GooglePart[]): GooglePart[] {
+  const firstFr = parts.findIndex((p) => p.functionResponse !== undefined);
+  if (firstFr === -1) return parts;
+  const movable = (p: GooglePart) =>
+    typeof p.text === "string" &&
+    p.thought !== true &&
+    typeof p.thoughtSignature !== "string";
+  let reorder = false;
+  for (let i = firstFr; i < parts.length; i++) {
+    if (movable(parts[i]!)) {
+      reorder = true;
+      break;
+    }
+  }
+  if (!reorder) return parts;
+  const moved: GooglePart[] = [];
+  const rest: GooglePart[] = [];
+  for (const p of parts) (movable(p) ? moved : rest).push(p);
+  return [...moved, ...rest];
+}
+
 /** Rebuild Gemini `contents` from kernel messages. Runs of same-side cores
  *  are merged into ONE content (Gemini rejects non-alternating roles): an
  *  assistant run becomes a single `{"role":"model"}` content whose parts are
  *  ordered reasoning, text, tool-call; a user-side run (user + tool-result)
- *  becomes a single `{"role":"user"}` content whose functionResponse parts
- *  lead. Mid-conversation system cores (host-synthetic; Gemini has no system
- *  role inside contents) ride on the user side as a text part. */
+ *  becomes a single `{"role":"user"}` content normalized by
+ *  normalizeGoogleUserPartOrder (#3159: plain text leads, functionResponse
+ *  parts trail). Mid-conversation system cores (host-synthetic; Gemini has no
+ *  system role inside contents) ride on the user side as a text part. */
 export function coreToGoogle(messages: BiliMessage[]): GoogleContent[] {
   const out: GoogleContent[] = [];
   let model: {
@@ -234,7 +266,10 @@ export function coreToGoogle(messages: BiliMessage[]): GoogleContent[] {
   };
   const flushUser = () => {
     if (!user) return;
-    const parts = [...user.responses, ...user.content];
+    const parts = normalizeGoogleUserPartOrder([
+      ...user.responses,
+      ...user.content,
+    ]);
     user = null;
     if (parts.length > 0) out.push({ role: "user", parts });
   };

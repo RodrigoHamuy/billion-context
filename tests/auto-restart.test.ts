@@ -15,6 +15,8 @@ import { startServer as startBiliServer, restartForceCloseOf } from "../src/serv
 import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
+import { isPidAlive } from "../src/instance.ts";
+import { UPGRADE_REPLACEMENT_ENV } from "../src/listen-policy.ts";
 
 const root = mkdtempSync(path.join(tmpdir(), "bc-auto-restart-"));
 process.env.XDG_CACHE_HOME = path.join(root, "cache");
@@ -170,7 +172,11 @@ function makeReadyStub(name: string): string {
         "import http from 'node:http';",
         "const port = Number(process.argv[2]);",
         "if (!Number.isFinite(port)) process.exit(64);",
-        "http.createServer((_req, res) => res.end('ok')).listen(port, '127.0.0.1');",
+        // #3182: a stolen port must be distinguishable from a product
+        // failure — exit 91 lets the retry wrapper below re-run the scenario.
+        "const srv = http.createServer((_req, res) => res.end('ok'));",
+        "srv.on('error', (e) => process.exit(e && e.code === 'EADDRINUSE' ? 91 : 1));",
+        "srv.listen(port, '127.0.0.1');",
     ].join("\n"));
     return p;
 }
@@ -464,10 +470,16 @@ test("performSelfRestart: hands the platform-specific spawn options through to s
                 finish: () => {},
             });
             assert.equal(result.ok, true, JSON.stringify(result));
+            const baseOpts = selfRestartSpawnOptions(platform);
             assert.deepEqual(
                 record.options,
-                selfRestartSpawnOptions(platform),
-                `${platform}: spawn must be called with the platform-specific options`,
+                {
+                    ...baseOpts,
+                    // #3044: the replacement is marked so it cannot inherit the
+                    // launcher's +1 ladder rights (bind-or-die on the freed port).
+                    env: { ...(baseOpts.env as NodeJS.ProcessEnv), [UPGRADE_REPLACEMENT_ENV]: "1" },
+                },
+                `${platform}: spawn must be called with the platform-specific options plus the #3044 replacement marker`,
             );
         } finally {
             record.child?.kill();
@@ -519,4 +531,186 @@ test("readLastRestart: tolerant of missing/corrupt markers", async () => {
     assert.equal(await readLastRestart(), undefined);
     await writeFile(path.join(markerDir, ".auto-restart"), JSON.stringify({ ts: 12345, from: "1.0.0", to: "1.0.1" }));
     assert.equal(await readLastRestart(), 12345);
+});
+
+// ---------------------------------------------------------------------------
+// #3044: occupied target port must never strand an orphan replacement. The
+// old shape: a replacement that hit EADDRINUSE on the freed port silently
+// hopped +1 and idled serving no client while the prior instance kept the
+// real port — accumulating one zombie per upgrade cycle. Pinned here at the
+// parent side (readiness verification + terminal decision); the child side
+// (bind-or-die) is pinned in listen-policy.test.ts and port-zone-live.test.ts.
+// ---------------------------------------------------------------------------
+
+function instancesDir(): string {
+    return path.join(process.env.XDG_STATE_HOME ?? "", "billion-context", "instances");
+}
+
+function writeRegistryEntry(entry: Record<string, unknown>): void {
+    mkdirSync(instancesDir(), { recursive: true });
+    const id = typeof entry.instanceId === "string" ? entry.instanceId : "anon";
+    writeFileSync(path.join(instancesDir(), `${id}.json`), JSON.stringify(entry));
+}
+
+// resumeListening is fire-and-forget (as in production): give the rebind a
+// bounded chance to complete before asserting on the listener state.
+async function waitForListening(server: { listening: boolean }, ms = 3000): Promise<boolean> {
+    const deadline = Date.now() + ms;
+    while (!server.listening && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 25));
+    }
+    return server.listening;
+}
+
+test("performSelfRestart: replacement spawn env carries the bind-or-die marker without mutating the parent env (#3044)", { timeout: 30_000 }, async () => {
+    const { server, port } = await startServer();
+    const { log } = makeLog();
+    const record: SpawnRecord = {};
+    process.env.BILI_TEST_SENTINEL = "sentinel-value";
+    try {
+        const result = await performSelfRestart({
+            server, host: "127.0.0.1", port,
+            installDir: makeInstall("1.0.1"),
+            runningVersion: "1.0.0", diskVersion: "1.0.1",
+            log, inFlightProvider: () => 0,
+            platform: "linux",
+            spawnImpl: makeSpawn(makeReadyStub("stub-marker.mjs"), port, record),
+            settleMs: 500, readyTimeoutMs: 5000,
+            finish: () => {},
+        });
+        assert.equal(result.ok, true, JSON.stringify(result));
+        const env = record.options?.env as NodeJS.ProcessEnv | undefined;
+        assert.ok(env, "spawn options carry an env");
+        assert.equal(env[UPGRADE_REPLACEMENT_ENV], "1", "replacement marked so it binds-or-dies on the freed port (#3044)");
+        assert.equal(env.BILI_TEST_SENTINEL, "sentinel-value", "inherited env survives the merge");
+        assert.equal(process.env[UPGRADE_REPLACEMENT_ENV], undefined, "the parent's own env must not be mutated");
+    } finally {
+        delete process.env.BILI_TEST_SENTINEL;
+        record.child?.kill();
+        server.closeAllConnections?.();
+        await new Promise<void>((r) => server.close(() => r()));
+    }
+});
+
+test("performSelfRestart: replacement that binds the WRONG port is terminated and service resumes (#3044)", { timeout: 30_000 }, async () => {
+    // #3182: the stub's port can be stolen by concurrent load on a shared
+    // shard runner (bind-0 TOCTOU). A stub that died with exit 91 never
+    // reached the product scenario — re-pick ports and re-run, bounded.
+    for (let attempt = 0; ; attempt++) {
+    const { server, port } = await startServer();
+    const { log, entries } = makeLog();
+    const record: SpawnRecord = {};
+    try {
+        const pending = performSelfRestart({
+            server, host: "127.0.0.1", port,
+            installDir: makeInstall("1.0.1"),
+            runningVersion: "1.0.0", diskVersion: "1.0.1",
+            log, inFlightProvider: () => 0,
+            // The stub listens on port+9 instead of the freed port: it models a
+            // replacement that drifted via the old ladder after EADDRINUSE.
+            spawnImpl: makeSpawn(makeReadyStub("stub-misplaced.mjs"), port + 9, record),
+            settleMs: 500, readyTimeoutMs: 5000,
+            finish: () => assert.fail("must not finish when the replacement drifted"),
+        });
+        for (let i = 0; i < 500 && record.child?.pid === undefined; i++) {
+            await new Promise((r) => setTimeout(r, 10));
+        }
+        assert.ok(record.child?.pid, "replacement spawned");
+        // The drifted replacement announces itself on the wrong port — exactly
+        // what the parent's readiness loop must catch instead of trusting TCP.
+        writeRegistryEntry({ instanceId: "stub-misplaced", pid: record.child.pid, port: port + 9, origin: `http://127.0.0.1:${port + 9}`, startedAt: Date.now(), lane: "dsh" });
+        const result = await pending;
+        assert.equal(result.ok, false, JSON.stringify(result));
+        assert.equal(result.error, `replacement-misplaced:${port + 9}`);
+        assert.match(entries.join("\n"), /bound port \d+ instead of \d+ — terminating/s);
+        assert.equal(await waitForListening(server), true, "original listener must be resumed");
+        assert.equal(await requestOk(port), true, "resumed listener must serve");
+        if (record.child?.pid !== undefined) {
+            for (let i = 0; i < 100 && isPidAlive(record.child.pid); i++) await new Promise((r) => setTimeout(r, 20));
+            assert.equal(isPidAlive(record.child.pid), false, "misplaced replacement must be gone — no orphan left behind");
+        }
+        break;
+    } catch (e) {
+        if (record.child?.exitCode !== 91 || attempt >= 2) throw e;
+    } finally {
+        record.child?.kill("SIGKILL");
+        server.closeAllConnections?.();
+        await new Promise<void>((r) => server.close(() => r()));
+    }
+    }
+});
+
+test("performSelfRestart: port taken over by another bili instance → parent exits instead of resuming (#3044)", { timeout: 30_000 }, async () => {
+    const { server, port } = await startServer();
+    const { log, entries } = makeLog();
+    const record: SpawnRecord = {};
+    let finished = 0;
+    // A live non-listening process standing in for a peer bili instance.
+    const sleeper = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000);"], { stdio: "ignore" });
+    try {
+        assert.ok(sleeper.pid, "sleeper pid for the fake peer");
+        // A live bili peer now owns our port (e.g. a host respawn that beat the
+        // replacement): resuming THIS old-code copy would ladder-drift it onto
+        // a fresh port nobody routes to — the zombie half of the leak.
+        writeRegistryEntry({ instanceId: "superseding-peer", pid: sleeper.pid, port, origin: `http://127.0.0.1:${port}`, startedAt: Date.now(), lane: "dsh" });
+        const result = await performSelfRestart({
+            server, host: "127.0.0.1", port,
+            installDir: makeInstall("1.0.1"),
+            runningVersion: "1.0.0", diskVersion: "1.0.1",
+            log, inFlightProvider: () => 0,
+            spawnImpl: makeSpawn(makeCrashStub("stub-superseded.mjs"), port, record),
+            settleMs: 500, readyTimeoutMs: 3000,
+            finish: () => { finished++; },
+        });
+        assert.equal(result.ok, true, "the upgrade landed elsewhere — handover achieved, parent exits cleanly");
+        assert.equal(finished, 1, "finish seam called exactly once");
+        assert.equal(server.listening, false, "no resume: the old-code copy must not drift onto a new port");
+        assert.match(entries.join("\n"), /served by bili instance pid \d+ — exiting instead of resuming/s);
+    } finally {
+        record.child?.kill();
+        try { sleeper.kill("SIGKILL"); } catch {}
+        server.closeAllConnections?.();
+        await new Promise<void>((r) => server.close(() => r()));
+    }
+});
+
+test("performSelfRestart: a replacement that survives SIGTERM is escalated loudly (#3044)", { timeout: 30_000, skip: process.platform === "win32" ? "POSIX-only: Windows terminates on SIGTERM uncatchably, so a SIGTERM-surviving stub cannot be modeled (was a w24 CI red, #3182 family)" : false }, async () => {
+    // #3182: same stolen-port retry as above (stub exit 91 = infra TOCTOU).
+    const stubborn = path.join(root, "stub-stubborn.mjs");
+    for (let attempt = 0; ; attempt++) {
+    const { server, port } = await startServer();
+    const { log, entries } = makeLog();
+    const record: SpawnRecord = {};
+    writeFileSync(stubborn, [
+        // No listener by design: the stub models a replacement that never
+        // reaches readiness. It only ignores SIGTERM to force the loud
+        // escalation path (#3044).
+        "process.on('SIGTERM', () => {});",
+        "setInterval(() => {}, 1000);",
+    ].join("\n"));
+    try {
+        const result = await performSelfRestart({
+            server, host: "127.0.0.1", port,
+            installDir: makeInstall("1.0.1"),
+            runningVersion: "1.0.0", diskVersion: "1.0.1",
+            log, inFlightProvider: () => 0,
+            spawnImpl: makeSpawn(stubborn, port, record),
+            settleMs: 500, readyTimeoutMs: 800, killVerifyMs: 400,
+            finish: () => assert.fail("must not finish while the replacement is stuck"),
+        });
+        assert.equal(result.ok, false, JSON.stringify(result));
+        assert.equal(result.error, "replacement-not-ready");
+        // An unverified kill was how the orphans of #3044 survived their
+        // parent's timeout — the loud escalation is the point of this test.
+        assert.match(entries.join("\n"), /still alive after SIGTERM — manual cleanup required \(kill \d+\)/s);
+        assert.equal(await waitForListening(server), true, "service resumes regardless");
+        break;
+    } catch (e) {
+        if (record.child?.exitCode !== 91 || attempt >= 2) throw e;
+    } finally {
+        record.child?.kill("SIGKILL");
+        server.closeAllConnections?.();
+        await new Promise<void>((r) => server.close(() => r()));
+    }
+    }
 });

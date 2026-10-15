@@ -10,9 +10,12 @@
 // Line grammar mirrors src/logger.ts (`<iso-ts> [level] [v=<build>] <msg>`),
 // so a shared log written by mixed-version hosts self-identifies every
 // physical line; `origin` marks which lane wrote it ([native-client],
-// [dsh-client], …). Best-effort — a failed append must never break the host;
-// appendFileSync reopens by path on every call, so the proxy's rotation
-// (rename to .old) can't strand these writes on a renamed inode.
+// [dsh-client], …). An EMPTY origin is allowed when the message already
+// carries its own prefix (launcher attach diagnostics, #3200) — the separator
+// is dropped so the line stays byte-identical to the legacy teeLog format.
+// Best-effort — a failed append must never break the host; appendFileSync
+// reopens by path on every call, so the proxy's rotation (rename to .old)
+// can't strand these writes on a renamed inode.
 import { appendFileSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import { defaultLogFile } from "../paths.js";
@@ -22,7 +25,7 @@ export function logHostEvent(level: "info" | "warn" | "error", origin: string, m
     try {
         const file = defaultLogFile();
         mkdirSync(path.dirname(file), { recursive: true });
-        appendFileSync(file, `${new Date().toISOString()} [${level}] [v=${VERSION}] ${origin} ${msg}\n`);
+        appendFileSync(file, `${new Date().toISOString()} [${level}] [v=${VERSION}] ${origin ? `${origin} ` : ""}${msg}\n`);
     } catch {
         // best-effort: logging must never break the host
     }

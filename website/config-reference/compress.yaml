@@ -62,6 +62,16 @@ entries:
     desc_zh: "分层 token 质量触发阈值；每层未设置时回退到派生默认值，缺省/空对象＝老的统一行为（#2376）。"
     site_en: "Per-tier token-mass trigger thresholds for the T1/T2/T3 paths; each unset sub-field keeps its derived value (T1 = growth step, T2/T3 = step × 1.5)."
     site_zh: "T1/T2/T3 路径的分层 token 质量触发阈值；未设置的子字段保持派生值（T1＝增长步长，T2/T3＝步长 × 1.5）。"
+  - key: compress.minPressureBenefitTokens
+    type: "number (≥ 0)"
+    default: "max(5000, limit × 1%)"
+    group: compress
+    id: cw.mpbt
+    render: compress-row
+    desc_en: "Minimum reclaimable tokens a pressure-band nudge must have to fire; on inflated-meter routes raise it so folds batch into big events instead of high-frequency small-yield churn (#3211). Explicit 0 = legacy any-pending."
+    desc_zh: "压力带 nudge 触发所需的最小可回收 token 数；虚报表线路调大它，让折叠攒成大批量而非高频小折（#3211）。显式 0＝老的任意 pending 行为。"
+    site_en: "Minimum reclaimable tokens for a pressure-band nudge to fire (default max(5000, limit × 1%)); explicit 0 restores legacy any-pending behavior (#3211)."
+    site_zh: "压力带 nudge 触发所需的最小可回收 token 数（默认 max(5000, 上限×1%)）；显式 0 恢复老的任意 pending 行为（#3211）。"
   - key: compress.nudgeModelDecided
     type: boolean
     default: "off (unset)"
@@ -94,14 +104,14 @@ entries:
     site_zh: "强制摘要从首次起走流式（SSE）——要求流式的上游现在通过任何非流式 400 上的一次性 SSE 探测自愈（#2494）；保留作为会掐断长非流式调用的网关（如 Cloudflare 524）的逃生通道（自学习无法感知该场景），也可用于省去一次探测往返。"
   - key: compress.preserveRecentMessages
     type: number
-    default: "kernel ≈5"
+    default: "3"
     group: compress
     id: cw.prm
     render: compress-row
     desc_en: "The most recent messages stay soft-protected from folds."
     desc_zh: "最近的消息软保护、免于折叠。"
-    site_en: "Kernel default ≈5: the most recent messages stay soft-protected from folds."
-    site_zh: "内核默认约 5：最近消息软保护、免于折叠。"
+    site_en: "Kernel default 3 (tuned 5 → 3, #3058): the most recent messages stay soft-protected from folds."
+    site_zh: "内核默认 3（5 → 3，#3058）：最近消息软保护、免于折叠。"
   - key: compress.preserveRecentTokens
     type: number
     default: "kernel ≈5000"

@@ -20,8 +20,9 @@ import { defaultConfig } from "acp-kernel";
 import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { dshPersonaFingerprintApplies, openaiSystemTextForPersona } from "../src/session-id.ts";
-// #2989: rig hygiene resets the LIVE session-order registry (the retired
-// persona-anchor ladder is no longer on the production path; this import was
+// #2989: rig hygiene resets the LIVE session-order registry (the persona-
+// anchor ladder is off the production path on every lane since #3134 —
+// v2 order resolution everywhere, google included; this import was
 // dead — never called — and its absence leaked skeletons across rigs).
 import { resetSessionOrderForTest } from "../src/session-resolve.ts";
 import { _rememberedForTest, _resetPluginStateForTest, resolveConversation } from "../src/plugin.ts";
@@ -128,8 +129,10 @@ async function startRig(upstreamHandler: UpstreamHandler = chatCompletionUpstrea
 
 async function closeRig(rig: Rig): Promise<void> {
     rig.proxy.close();
+    rig.proxy.closeIdleConnections?.();
     await once(rig.proxy, "close");
     rig.upstream.close();
+    rig.upstream.closeIdleConnections?.();
     await once(rig.upstream, "close");
 }
 
@@ -490,6 +493,200 @@ test("e2e allowlist pin: a non-dsh plugin agent with two different systems stays
         assert.ok(peekSession(CONV), "session exists under the raw key");
         assert.equal(peekSession(CONV)?.stats.requests, 2, "both requests rode the same session — no persona fork for non-dsh agents (#1106 verbatim keying)");
         assert.ok(!peekSession(forkKey(CONV, REVIEW_SYSTEM)), "no forked session was created");
+    } finally {
+        await closeRig(rig);
+    }
+});
+
+// #2730: the google lane now gets the same persona keying as openai/anthropic/
+// responses. Before this, google requests ALWAYS keyed verbatim (rawPersonaIdentity
+// had no google case), so a dsh review persona riding gemini would merge into the
+// main session exactly like #1916/#2203 did on the other wires. dsh CAN route
+// google: it stamps x-bili-plugin: dsh wire-agnostically (dsh-native.ts) and its
+// MODEL_API_SUFFIX gate accepts google paths.
+test("e2e google lane #2730: review persona forks onto `|sub:<fp>`; main session untouched; forks are stable", async () => {
+    const rig = await startRig((req, res) => {
+        req.resume();
+        req.on("end", () => {
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({
+                candidates: [{ content: { role: "model", parts: [{ text: "ok" }] }, finishReason: "STOP" }],
+                modelVersion: "gemini-test",
+                usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 3, totalTokenCount: 13 },
+            }));
+        });
+    });
+    const CONV = "dshp-google";
+    try {
+        const url = `http://127.0.0.1:${rig.proxyPort}/bili/http://127.0.0.1:${rig.upstreamPort}/v1beta/models/gemini-test:generateContent`;
+        const headers: Record<string, string> = { "content-type": "application/json", "x-bili-plugin": "dsh", "x-bili-plugin-conversation": CONV };
+        const gContents = (n: number): { role: string; parts: { text: string }[] }[] =>
+            Array.from({ length: n }, (_, i): { role: string; parts: { text: string }[] } => ({
+                role: i % 2 === 0 ? "user" : "model",
+                parts: [{ text: `main-${i + 1}-` + "z".repeat(6000) }],
+            }));
+
+        // Phase 1 — main turn claims the raw key (anchor: MAIN_SYSTEM as systemInstruction).
+        const r1 = await fetch(url, { method: "POST", headers, body: JSON.stringify({ contents: gContents(12), systemInstruction: { parts: [{ text: MAIN_SYSTEM }] }, generationConfig: { maxOutputTokens: 64_000 } }) });
+        assert.equal(r1.status, 200);
+        await r1.text();
+        const main = getSession(CONV);
+        assert.ok(main, "main session exists under the raw conversation key");
+        assert.ok(Object.keys(main.state.messageRefs.byRaw).length >= 12, "refs assigned to the main history");
+        assert.ok((_rememberedForTest().get(CONV)?.processed.length ?? 0) >= 12, "remembered snapshot holds the main view");
+
+        // Phase 2 — auto-review shape (fixed REVIEW_POLICY systemInstruction +
+        // flattened blob) under the SAME conversation id: forks onto `|sub:<fp>`.
+        const review = (blob: string) => ({
+            contents: [{ role: "user", parts: [{ text: `Conversation transcript (flattened):\n${blob}\nDecide: risky?` }] }],
+            systemInstruction: { parts: [{ text: REVIEW_SYSTEM }] },
+            generationConfig: { maxOutputTokens: 384_000 },
+        });
+        const r2 = await fetch(url, { method: "POST", headers, body: JSON.stringify(review("user: build it\nassistant: ok")) });
+        assert.equal(r2.status, 200);
+        await r2.text();
+        const fork = forkKey(CONV, REVIEW_SYSTEM);
+        const fk = peekSession(fork);
+        assert.ok(fk, "review request landed on its own forked session on the google lane too");
+        assert.equal((_rememberedForTest().get(CONV)?.processed.length ?? 0) >= 12, true, "main snapshot untouched (the review never even reached the main session)");
+        assert.equal(getSession(CONV)?.stats.requests, 1, "main session request count unchanged by the review");
+        assert.equal(fk.stats.requests, 1, "forked session served the review");
+        assert.equal(fk.metadata.personaNamespace, true, "fork stamped as a designed split (canary exemption, #2170 measure 4)");
+        assert.notEqual(getSession(CONV)?.metadata.personaNamespace, true, "main session is not namespaced");
+
+        // Phase 3 — a second review (same policy systemInstruction, fresh blob)
+        // reuses the SAME forked session (persona stability, not a fork per call).
+        const r3 = await fetch(url, { method: "POST", headers, body: JSON.stringify(review("user: build it again\nassistant: done")) });
+        assert.equal(r3.status, 200);
+        await r3.text();
+        assert.equal(getSession(fork)?.stats.requests, 2, "successive reviews share one forked session");
+        assert.equal(getSession(CONV)?.stats.requests, 1, "main session still at one request");
+
+        // Phase 4 — a main turn (MAIN_SYSTEM) keeps the raw key (anchor).
+        const r4 = await fetch(url, { method: "POST", headers, body: JSON.stringify({ contents: gContents(4), systemInstruction: { parts: [{ text: MAIN_SYSTEM }] }, generationConfig: { maxOutputTokens: 64_000 } }) });
+        assert.equal(r4.status, 200);
+        await r4.text();
+        assert.equal(getSession(CONV)?.stats.requests, 2, "main turn still rides the raw key");
+
+        // Phase 5 — conversations map discipline (#970/#2156): the raw key points
+        // at the MAIN session even though the fork recorded itself under its
+        // suffixed id (before the rawPersonaIdentity google case, the fork would
+        // have recorded under the raw id and flipped this map entry).
+        const mainId = getSession(CONV).id;
+        assert.equal(resolveConversation(CONV)?.entry?.sessionId, mainId, "raw conversation key still resolves to the main session id");
+        assert.equal(resolveConversation(fork)?.entry?.sessionId, fk.id, "forked conversation key resolves to the forked session");
+
+        // Phase 6 — a systemInstruction-less auxiliary call is non-anchoring:
+        // verbatim key, rides the main session (kernel empty-instructions path).
+        const r5 = await fetch(url, { method: "POST", headers, body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: "hi" }] }], generationConfig: { maxOutputTokens: 64_000 } }) });
+        assert.equal(r5.status, 200);
+        await r5.text();
+        assert.equal(getSession(CONV)?.stats.requests, 3, "systemInstruction-less request keeps the raw key");
+    } finally {
+        await closeRig(rig);
+    }
+});
+
+test("e2e google lane allowlist pin: a non-dsh plugin agent with two different systems stays on ONE session", async () => {
+    const rig = await startRig((req, res) => {
+        req.resume();
+        req.on("end", () => {
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({ candidates: [{ content: { role: "model", parts: [{ text: "ok" }] }, finishReason: "STOP" }], usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 3, totalTokenCount: 13 } }));
+        });
+    });
+    const CONV = "dshp-google-plain";
+    try {
+        const url = `http://127.0.0.1:${rig.proxyPort}/bili/http://127.0.0.1:${rig.upstreamPort}/v1beta/models/gemini-test:generateContent`;
+        const headers: Record<string, string> = { "content-type": "application/json", "x-bili-plugin": "test-agent", "x-bili-plugin-conversation": CONV };
+        const r1 = await fetch(url, { method: "POST", headers, body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: "u1" }] }], systemInstruction: { parts: [{ text: MAIN_SYSTEM }] }, generationConfig: { maxOutputTokens: 64_000 } }) });
+        await r1.text();
+        const r2 = await fetch(url, { method: "POST", headers, body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: "risky?" }] }], systemInstruction: { parts: [{ text: REVIEW_SYSTEM }] }, generationConfig: { maxOutputTokens: 64_000 } }) });
+        await r2.text();
+        assert.ok(peekSession(CONV), "session exists under the raw key");
+        assert.equal(peekSession(CONV)?.stats.requests, 2, "both requests rode the same session — no persona fork for non-dsh agents on the google lane (#1106 verbatim keying)");
+        assert.ok(!peekSession(forkKey(CONV, REVIEW_SYSTEM)), "no forked session was created");
+    } finally {
+        await closeRig(rig);
+    }
+});
+
+// #3134: cross-lane consistency — the google lane rides the SAME v2 order
+// resolver as the other lanes since #3134 (#3060 migrated four call sites;
+// the google one was left on the retired v1 personaNamespace ladder, its
+// import restored by a9378038). ONE dsh conversation id may be stamped on
+// requests that travel DIFFERENT wires (main turns on one, an auto-review
+// persona on another); persona attribution must not depend on which wire
+// carried the request: the aux persona forks onto its own `|sub:<fp>` key
+// on BOTH wires (the fp is over the persona system text — lane-independent,
+// so the same persona converges on ONE fork session), and the main
+// conversation keeps the raw key on both.
+test("e2e cross-lane #3134: one dsh conversation id across google + openai lanes keys personas consistently", async () => {
+    const rig = await startRig((req, res) => {
+        req.resume();
+        req.on("end", () => {
+            const google = (req.url ?? "").includes("v1beta");
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify(google
+                ? {
+                    candidates: [{ content: { role: "model", parts: [{ text: "ok" }] }, finishReason: "STOP" }],
+                    modelVersion: "gemini-test",
+                    usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 3, totalTokenCount: 13 },
+                }
+                : {
+                    id: "chatcmpl-1",
+                    object: "chat.completion",
+                    choices: [{ index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" }],
+                    usage: { prompt_tokens: 10, completion_tokens: 3, total_tokens: 13 },
+                }));
+        });
+    });
+    const CONV = "dshp-xlane";
+    const openaiUrl = `http://127.0.0.1:${rig.proxyPort}/bili/http://127.0.0.1:${rig.upstreamPort}/v1/chat/completions`;
+    const googleUrl = `http://127.0.0.1:${rig.proxyPort}/bili/http://127.0.0.1:${rig.upstreamPort}/v1beta/models/gemini-test:generateContent`;
+    const headers: Record<string, string> = { "content-type": "application/json", "x-bili-plugin": "dsh", "x-bili-plugin-conversation": CONV };
+    try {
+        const gContents = (n: number): { role: string; parts: { text: string }[] }[] =>
+            Array.from({ length: n }, (_, i): { role: string; parts: { text: string }[] } => ({
+                role: i % 2 === 0 ? "user" : "model",
+                parts: [{ text: `main-${i + 1}-` + "z".repeat(6000) }],
+            }));
+
+        // Phase 1 — openai main turn (MAIN_SYSTEM) claims the raw key.
+        const r1 = await fetch(openaiUrl, { method: "POST", headers, body: JSON.stringify({ model: MODEL, max_tokens: 64_000, messages: [{ role: "system", content: MAIN_SYSTEM }, ...mainMsgs(12)] }) });
+        assert.equal(r1.status, 200);
+        await r1.text();
+        assert.ok(getSession(CONV), "main session exists under the raw conversation key (openai main turn claimed it)");
+        assert.equal(getSession(CONV)?.stats.requests, 1, "one main request on the raw key");
+
+        // Phase 2 — the review persona rides the GOOGLE wire (same id, fixed
+        // REVIEW_POLICY systemInstruction + flattened blob): forks `|sub:<fp>`.
+        const r2 = await fetch(googleUrl, { method: "POST", headers, body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: "Conversation transcript (flattened):\nuser: build it\nassistant: ok\nDecide: risky?" }] }], systemInstruction: { parts: [{ text: REVIEW_SYSTEM }] }, generationConfig: { maxOutputTokens: 384_000 } }) });
+        assert.equal(r2.status, 200);
+        await r2.text();
+        const fork = forkKey(CONV, REVIEW_SYSTEM);
+        assert.ok(peekSession(fork), "review persona on the google wire forked onto its own `|sub:` key");
+        assert.equal(getSession(CONV)?.stats.requests, 1, "raw key untouched by the google-wire review");
+        assert.equal(peekSession(fork)?.stats.requests, 1, "forked session served the google-wire review");
+
+        // Phase 3 — the SAME review persona rides the openai wire: same fp,
+        // same fork key — ONE fork session across wires, not one per lane.
+        const r3 = await fetch(openaiUrl, { method: "POST", headers, body: JSON.stringify({ model: MODEL, max_tokens: 384_000, messages: [{ role: "system", content: REVIEW_SYSTEM }, { role: "user", content: "Conversation transcript (flattened):\nuser: build it again\nassistant: done\nDecide: risky?" }] }) });
+        assert.equal(r3.status, 200);
+        await r3.text();
+        assert.equal(peekSession(fork)?.stats.requests, 2, "same persona on the openai wire reused the SAME forked session (cross-lane attribution consistency)");
+        assert.equal(getSession(CONV)?.stats.requests, 1, "main session still untouched");
+
+        // Phase 4 — a google-wire main turn keeps the raw key.
+        const r4 = await fetch(googleUrl, { method: "POST", headers, body: JSON.stringify({ contents: gContents(12), systemInstruction: { parts: [{ text: MAIN_SYSTEM }] }, generationConfig: { maxOutputTokens: 64_000 } }) });
+        assert.equal(r4.status, 200);
+        await r4.text();
+        assert.equal(getSession(CONV)?.stats.requests, 2, "google-wire main turn keeps the raw key (persona attribution is wire-independent)");
+
+        // Phase 5 — conversations map discipline (#970): the raw key keeps
+        // resolving to the MAIN session despite the cross-wire fork.
+        assert.equal(resolveConversation(CONV)?.entry?.sessionId, getSession(CONV)?.id, "raw conversation key still resolves to the main session");
+        assert.equal(resolveConversation(fork)?.entry?.sessionId, peekSession(fork)?.id, "fork key resolves to the forked session");
     } finally {
         await closeRig(rig);
     }

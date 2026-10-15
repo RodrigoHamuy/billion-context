@@ -147,7 +147,9 @@ test("#2096 e2e: [window] reports the base, [headroom] reports the enforced effe
     } finally {
         setLogCapture(null);
         h.proxy.close();
+        h.proxy.closeIdleConnections?.();
         h.upstream.close();
+        h.upstream.closeIdleConnections?.();
         await Promise.allSettled([once(h.proxy, "close"), once(h.upstream, "close")]);
     }
 });

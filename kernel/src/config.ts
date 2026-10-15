@@ -29,7 +29,9 @@ export function defaultConfig(
     },
     protectedTools: [],
     protectedLatestTools: [],
-    preserveRecentMessages: 5,
+    // #3058: 5 → 3 — owner-tuned: 3 keeps the active turn + previous exchange
+    // verbatim while older history folds earlier (tighter context reclaim).
+    preserveRecentMessages: 3,
     preserveRecentTokens: 5000,
     modelContextLimit,
     absorb: {

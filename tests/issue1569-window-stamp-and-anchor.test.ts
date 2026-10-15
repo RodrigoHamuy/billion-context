@@ -453,8 +453,10 @@ async function runAnchorCase(sessionId: string, reportUsage: boolean): Promise<{
     } finally {
         setLogCapture(null);
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         relay.server.close();
+        relay.server.closeIdleConnections?.();
         await once(relay.server, "close");
     }
 }

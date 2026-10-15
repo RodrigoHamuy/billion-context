@@ -19,9 +19,19 @@
 import { createHash } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
+import { log as loggerLog } from "../logger.js";
 import { openSqliteDatabase, type SqliteDatabase, type SqliteEngineName, type SqliteEngineSource } from "./driver.js";
-import { migrateSchema, STORAGE_PRAGMAS } from "./schema.js";
+import { migrateSchema, storagePragmas, WAL_JOURNAL_SIZE_LIMIT } from "./schema.js";
 import type { MessageContentStore } from "acp-kernel";
+
+/** #3250: run a PASSIVE wal_checkpoint every N successful ingests. The
+ *  built-in autocheckpoint alone cannot guarantee reclamation in a long-lived
+ *  process: while a foreign connection holds a read snapshot (dashboard /
+ *  export / second lane sharing the directory — #2671 topology) WAL backfill
+ *  is blocked at that snapshot and the file grows until the reader lets go.
+ *  PASSIVE never blocks the ingest path; a failed checkpoint is logged and
+ *  forgotten — the next tick retries and journal_size_limit does the rest. */
+const WAL_CHECKPOINT_EVERY_INGESTS = 20;
 
 export function sha256Hex(bytes: string | Buffer): string {
     return createHash("sha256").update(bytes).digest("hex");
@@ -58,6 +68,11 @@ export interface SessionRow {
     tailJson: string;
     /** Verbatim CCR store JSON (dying subsystem, Phase 3 removes it). */
     ccrJson: string | null;
+    /** #3133 ingest watermark: highest absolute message seq whose bytes this
+     *  index has verified (NULL = no trusted prefix → next save ingests
+     *  fully). Computed by ingestSession only (delta provenance or full-path
+     * alignment) — never by planners or callers; read via ingestWatermark(). */
+    lastIngestedSeq?: number | null;
 }
 
 export interface MessageRow {
@@ -71,6 +86,10 @@ export interface MessageRow {
     kind: string;
     /** Verbatim serialized message (includes id; exact parsed-file bytes). */
     content: string;
+    /** #3133: sha256(content) as computed by the planner's intern pass —
+     *  lets ingestSession skip re-hashing every message on every save.
+     *  Identical value to sha256Hex(content); optional for direct callers. */
+    contentHash?: string;
 }
 
 export interface BlockRow {
@@ -170,11 +189,48 @@ export interface IngestSessionInput {
     tailSeqs?: number[] | null;
 }
 
+/** Extension-namespace guards (#3069): keys/namespaces are non-empty
+ *  printable ASCII-range strings up to 256 chars — loose by design (callers
+ *  namespace by convention like "r3:" / "web:" / "lane:"), hostile by
+ *  accident is what we guard, not hostile by design. */
+const EXT_KEY_MAX = 256;
+const EXT_VALUE_MAX_BYTES = 4 * 1024 * 1024;
+
+function validateExtKey(value: string, what: string): void {
+    if (typeof value !== "string" || value.length === 0 || value.length > EXT_KEY_MAX) {
+        throw new Error(`[storage] extension ${what} must be a non-empty string of at most ${EXT_KEY_MAX} characters`);
+    }
+    for (let i = 0; i < value.length; i++) {
+        const c = value.charCodeAt(i);
+        if (c < 0x20 || c === 0x7f) {
+            throw new Error(`[storage] extension ${what} must not contain control characters`);
+        }
+    }
+}
+
+function serializeExtValue(value: unknown): string {
+    const json = JSON.stringify(value);
+    if (json === undefined) {
+        throw new Error("[storage] extension values must be JSON-serializable (undefined/functions are not)");
+    }
+    if (json.length > EXT_VALUE_MAX_BYTES) {
+        throw new Error(`[storage] extension value exceeds ${EXT_VALUE_MAX_BYTES} bytes — store large payloads in the content CAS instead`);
+    }
+    return json;
+}
+
+/** Escapes LIKE metacharacters for the ESCAPE '\\' clause used by listKv. */
+function likeEscape(prefix: string): string {
+    return prefix.replace(/[\\%_]/g, (ch) => "\\" + ch);
+}
+
 export class UnifiedStore {
     readonly engine: SqliteEngineName;
     /** Where the engine came from (#2833): builtin / host / self-downloaded — logged at enable so field diagnosis can tell which acquisition path a lane ran on. */
     readonly engineSource: SqliteEngineSource;
     private readonly db: SqliteDatabase;
+    /** #3250: successful-ingest counter driving the WAL_CHECKPOINT_EVERY_INGESTS cadence. */
+    private ingestCount = 0;
 
     private constructor(db: SqliteDatabase, engine: SqliteEngineName, engineSource: SqliteEngineSource) {
         this.db = db;
@@ -182,11 +238,16 @@ export class UnifiedStore {
         this.engineSource = engineSource;
     }
 
-    static open(path: string, engine?: SqliteEngineName): UnifiedStore {
+    static open(
+        path: string,
+        engine?: SqliteEngineName,
+        opts?: { walJournalSizeLimitBytes?: number },
+    ): UnifiedStore {
         mkdirSync(dirname(path), { recursive: true });
         const { db, engine: used, source } = openSqliteDatabase(path, engine);
         try {
-            for (const pragma of STORAGE_PRAGMAS) db.exec(pragma);
+            const limit = opts?.walJournalSizeLimitBytes ?? WAL_JOURNAL_SIZE_LIMIT;
+            for (const pragma of storagePragmas(limit)) db.exec(pragma);
             migrateSchema(db);
         } catch (err) {
             // The handle we just opened must not leak when the file turns out
@@ -197,17 +258,42 @@ export class UnifiedStore {
             db.close();
             throw err;
         }
+        // #3250: converge the WAL an unclean exit left behind (SIGKILL / power
+        // loss never reaches close()). Moving committed frames into the main db
+        // now shortens the NEXT crash's recovery replay. Isolated from the open
+        // contract above on purpose: under a multi-process shared directory
+        // (#2671) a TRUNCATE can come back busy while a foreign connection is
+        // mid-transaction — that must log, not fail the open; the periodic and
+        // close-time passes retry the reclamation.
+        try {
+            db.prepare("PRAGMA wal_checkpoint(TRUNCATE)").get();
+        } catch (err) {
+            loggerLog("warn", `[storage] WAL checkpoint on open failed for ${path}: ${String(err)}`);
+        }
         return new UnifiedStore(db, used, source);
     }
 
     close(): void {
+        // #3250: converge the WAL before releasing the handle so a clean exit
+        // leaves nothing for the next boot's recovery to replay. Same isolation
+        // as open(): a checkpoint hiccup logs and never throws — callers treat
+        // close() as best-effort shutdown work.
+        try {
+            this.db.prepare("PRAGMA wal_checkpoint(TRUNCATE)").get();
+        } catch (err) {
+            loggerLog("warn", `[storage] WAL checkpoint on close failed: ${String(err)}`);
+        }
         this.db.close();
     }
 
     /** Content CAS: insert-if-absent + refcount bump; returns hash. */
-    private putContent(content: string | Buffer): string {
+    private putContent(content: string | Buffer, precomputedHash?: string): string {
         const bytes = typeof content === "string" ? Buffer.from(content, "utf8") : content;
-        const hash = sha256Hex(bytes);
+        // #3133: planner-produced rows carry the digest from their intern or
+        // delta pass — skip the per-message re-hash here (same value: sha256
+        // over the same utf8 bytes). Only direct callers without a planner
+        // pay the hash at this layer.
+        const hash = precomputedHash ?? sha256Hex(bytes);
         const existing = this.db.prepare("SELECT refcount FROM content WHERE hash = ?").get(hash) as
             | { refcount: number }
             | undefined;
@@ -227,56 +313,88 @@ export class UnifiedStore {
         this.db.prepare("UPDATE content SET refcount = MAX(refcount - 1, 0) WHERE hash = ?").run(hash);
     }
 
-    ingestSession(input: IngestSessionInput): void {
+    /** Ingests one session plan as a single transaction. Full path (no
+     *  `delta`): identity-based absolute-seq remap of every plan row; the
+     *  watermark becomes the abs seq backing the plan's LAST tail message
+     *  (NULL when the plan carries no tail) — the trusted tip need not be
+     *  the table's max, because delta appends anchor at max(seq)+1, never
+     *  at watermark+1, so rows above the tip (a fold's summary) cannot
+     *  collide with them.
+     *
+     *  Delta path (#3133, `delta` given): the plan carries ONLY messages
+     *  past the trusted prefix, with placeholder seqs (renumbered here).
+     *  The boundary row (msg_id + content_hash at seq trustedSeq) is
+     *  RE-VERIFIED inside this transaction (BEGIN IMMEDIATE serializes
+     *  writers, so the in-tx check is authoritative — the caller's pre-plan
+     *  probe was just an optimization), every delta message's identity must
+     *  be absent (strictly-append — a re-derived tail would otherwise be
+     *  silently dropped by the UNIQUE constraint), and new rows take
+     *  max(seq)+1.. so no slot can collide. On any disagreement this
+     *  returns false WITHOUT writing anything; the caller falls back to the
+     *  full plan. A stale or foreign-written watermark therefore costs one
+     *  redundant full write — never wrong rows — and the watermark write
+     *  itself rides the SAME transaction as the rows. */
+    ingestSession(
+        input: IngestSessionInput,
+        delta?: { trustedSeq: number; boundaryMsgId: string; boundaryHash: string; trustedTailSeqs: number[] },
+    ): boolean {
         const s = input.session;
-        this.db.transaction(() => {
-            // Absolute-seq remap (#2671 soak finding): planIngest assigns seq
-            // RELATIVE to the current snapshot's log (pluginSnapshot first,
-            // then tail). For a folded session whose tail slides every save
-            // (and no pluginSnapshot to pin the prefix), plan seq 0 re-bases
-            // to a DIFFERENT message each save — while messages is keyed
-            // (session_id, seq) with INSERT OR IGNORE, so the FIRST row wins
-            // forever and tail pointers resolve to stale turns. Remap to
-            // stable absolute seqs: same identity (msgId + content hash)
-            // keeps its old seq; new identities continue after max(seq).
-            const existing = this.db
-                .prepare("SELECT seq, msg_id, content_hash FROM messages WHERE session_id = ?")
-                .all(s.sessionId) as { seq: number; msg_id: string; content_hash: string }[];
-            const seqByIdentity = new Map<string, number>();
-            let nextSeq = 0;
-            for (const row of existing) {
-                seqByIdentity.set(`${row.msg_id}\u0000${row.content_hash}`, row.seq);
-                if (row.seq + 1 > nextSeq) nextSeq = row.seq + 1;
-            }
-            const planToAbs = new Map<number, number>();
-            const messages = input.messages.map((m) => {
-                const hash = sha256Hex(m.content);
-                const key = `${m.msgId}\u0000${hash}`;
-                let abs = seqByIdentity.get(key);
-                if (abs === undefined) {
-                    abs = nextSeq++;
-                    seqByIdentity.set(key, abs);
+        const ok = this.db.transaction((): boolean => {
+            let messages: MessageRow[];
+            let watermark: number | null;
+            if (delta) {
+                const probe = this.probeIngestBoundary(s.sessionId, delta.trustedSeq);
+                if (!probe || probe.msgId !== delta.boundaryMsgId || probe.contentHash !== delta.boundaryHash) {
+                    return false;
                 }
-                planToAbs.set(m.seq, abs);
-                return { ...m, seq: abs };
-            });
-            const remapSeqs = (seqs: number[] | null | undefined): number[] | null | undefined =>
-                seqs === null || seqs === undefined ? seqs : seqs.map((p) => planToAbs.get(p) ?? p);
-            const pluginSnapshotSeqs = remapSeqs(input.pluginSnapshotSeqs);
-            const tailSeqs = remapSeqs(input.tailSeqs);
-            s.tailJson = JSON.stringify({
-                ...(JSON.parse(s.tailJson) as Record<string, unknown>),
-                ...(pluginSnapshotSeqs !== undefined ? { pluginSnapshotSeqs } : {}),
-                ...(tailSeqs !== undefined ? { tailSeqs } : {}),
-            });
+                // Strictly-append guard: a delta message whose identity
+                // already has a row (rewound/re-derived tail) must not be
+                // silently skipped by the UNIQUE(session_id, msg_id,
+                // content_hash) constraint — its tailSeqs slot would point
+                // at nothing and the read view would drop it. One indexed
+                // probe per NEW message; any hit → full ingest instead.
+                const existingIdentity = this.db.prepare(
+                    "SELECT 1 FROM messages WHERE session_id = ? AND msg_id = ? AND content_hash = ?",
+                );
+                for (const m of input.messages) {
+                    if (!m.contentHash) return false;
+                    if (existingIdentity.get(s.sessionId, m.msgId, m.contentHash)) return false;
+                }
+                // Placeholder→absolute renumber: the plan emitted
+                // watermark+1.. under the aligned assumption; anchoring at
+                // the CURRENT max(seq)+1 (re-read inside this transaction)
+                // is what makes slot collisions structurally impossible —
+                // identical to the full path's nextSeq discipline, and it
+                // keeps the delta valid even when a fold left rows above
+                // the trusted tip.
+                messages = input.messages.map((m, i) => ({ ...m, seq: probe.maxSeq + 1 + i }));
+                const tail = JSON.parse(s.tailJson) as { tailSeqs?: number[] | null };
+                // Defense: the plan's tailSeqs prefix must be exactly the
+                // trusted prefix the watermark read produced (same-tick by
+                // construction; disagreement means a stale plan).
+                const prefixOk =
+                    Array.isArray(tail.tailSeqs) &&
+                    tail.tailSeqs.length === delta.trustedTailSeqs.length + input.messages.length &&
+                    delta.trustedTailSeqs.every((v, i) => tail.tailSeqs?.[i] === v);
+                if (!prefixOk) return false;
+                s.tailJson = JSON.stringify({
+                    ...tail,
+                    tailSeqs: [...delta.trustedTailSeqs, ...messages.map((m) => m.seq)],
+                });
+                watermark = messages.length > 0 ? messages[messages.length - 1].seq : delta.trustedSeq;
+            } else {
+                const full = this.remapPlanToAbsolute(input);
+                messages = full.messages;
+                watermark = full.watermark;
+            }
             this.db
                 .prepare(
                     `INSERT INTO sessions (session_id, parent_session_id, fork_point_seq, protocol, label, title, host_title, namespace, origin,
                        status, created_at, updated_at, next_block_id, next_run_id,
-                       meta_json, stats_json, metadata_json, kstate_json, tail_json, ccr_json)
+                       meta_json, stats_json, metadata_json, kstate_json, tail_json, ccr_json, last_ingested_seq)
                      VALUES (@sessionId, @parentSessionId, @forkPointSeq, @protocol, @label, @title, @hostTitle, @namespace, @origin,
                        @status, @createdAt, @updatedAt, @nextBlockId, @nextRunId,
-                       @metaJson, @statsJson, @metadataJson, @kstateJson, @tailJson, @ccrJson)
+                       @metaJson, @statsJson, @metadataJson, @kstateJson, @tailJson, @ccrJson, @lastIngestedSeq)
                      ON CONFLICT(session_id) DO UPDATE SET
                        parent_session_id = excluded.parent_session_id,
                        fork_point_seq = excluded.fork_point_seq,
@@ -295,7 +413,8 @@ export class UnifiedStore {
                        metadata_json = excluded.metadata_json,
                        kstate_json = excluded.kstate_json,
                        tail_json = excluded.tail_json,
-                       ccr_json = excluded.ccr_json`,
+                       ccr_json = excluded.ccr_json,
+                       last_ingested_seq = excluded.last_ingested_seq`,
                 )
                 .run({
                     sessionId: s.sessionId,
@@ -318,6 +437,7 @@ export class UnifiedStore {
                     kstateJson: s.kstateJson,
                     tailJson: s.tailJson,
                     ccrJson: s.ccrJson,
+                    lastIngestedSeq: watermark,
                 });
 
             // Identity index (#2960 R2.1): claim (namespace, conversation_id)
@@ -331,7 +451,7 @@ export class UnifiedStore {
                 .run(s.namespace ?? "proxy", s.sessionId, s.sessionId, s.updatedAt);
 
             for (const m of messages) {
-                const hash = this.putContent(m.content);
+                const hash = this.putContent(m.content, m.contentHash);
                 const res = this.db
                     .prepare(
                         "INSERT OR IGNORE INTO messages (session_id, seq, msg_id, ref, ref_num, role, kind, content_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -453,7 +573,134 @@ export class UnifiedStore {
                     .prepare("INSERT INTO ccr_entries (session_id, ord, ccr_key, content_hash) VALUES (?, ?, ?, ?)")
                     .run(s.sessionId, e.ord, e.key, hash);
             }
+            return true;
         });
+        if (ok) this.maybeCheckpointWal();
+        return ok;
+    }
+
+    /** #3250: cadence-tick WAL reclamation (see WAL_CHECKPOINT_EVERY_INGESTS).
+     *  Never throws into the ingest path — a failed checkpoint just leaves the
+     *  WAL longer than ideal until the next tick. */
+    private maybeCheckpointWal(): void {
+        this.ingestCount += 1;
+        if (this.ingestCount % WAL_CHECKPOINT_EVERY_INGESTS !== 0) return;
+        try {
+            // Log the result: operators tuning storage.walJournalSizeLimitBytes
+            // need to see whether ticks are actually reclaiming frames.
+            const row = this.db.prepare("PRAGMA wal_checkpoint(PASSIVE)").get() as { busy: number; log: number; checkpointed: number };
+            loggerLog(
+                "debug",
+                `[storage] periodic WAL checkpoint at ingest ${this.ingestCount}: busy=${row.busy} log=${row.log} checkpointed=${row.checkpointed}`,
+            );
+        } catch (err) {
+            loggerLog("debug", `[storage] periodic WAL checkpoint failed at ingest ${this.ingestCount}: ${String(err)}`);
+        }
+    }
+
+    /** Full-ingest path of ingestSession, extracted for readability: the
+     *  absolute-seq remap plus the #3133 watermark alignment decision.
+     *  Mutates input.session.tailJson (pointer sequences become absolute). */
+    private remapPlanToAbsolute(input: IngestSessionInput): { messages: MessageRow[]; watermark: number | null } {
+        const s = input.session;
+        // Absolute-seq remap (#2671 soak finding): planIngest assigns seq
+        // RELATIVE to the current snapshot's log (pluginSnapshot first,
+        // then tail). For a folded session whose tail slides every save
+        // (and no pluginSnapshot to pin the prefix), plan seq 0 re-bases
+        // to a DIFFERENT message each save — while messages is keyed
+        // (session_id, seq) with INSERT OR IGNORE, so the FIRST row wins
+        // forever and tail pointers resolve to stale turns. Remap to
+        // stable absolute seqs: same identity (msgId + content hash)
+        // keeps its old seq; new identities continue after max(seq).
+        const existing = this.db
+            .prepare("SELECT seq, msg_id, content_hash FROM messages WHERE session_id = ?")
+            .all(s.sessionId) as { seq: number; msg_id: string; content_hash: string }[];
+        const seqByIdentity = new Map<string, number>();
+        let nextSeq = 0;
+        for (const row of existing) {
+            seqByIdentity.set(`${row.msg_id}\u0000${row.content_hash}`, row.seq);
+            if (row.seq + 1 > nextSeq) nextSeq = row.seq + 1;
+        }
+        // #3133 watermark gate (full path): the watermark names the abs seq
+        // backing the plan's LAST tail message. It need not be the table's
+        // max — a fold's summary lands above surviving old rows — because
+        // delta appends anchor at max(seq)+1, never at watermark+1. NULL
+        // when the plan carries no tail (envelope-only imports): the next
+        // save runs the full ingest.
+        const planToAbs = new Map<number, number>();
+        const messages = input.messages.map((m) => {
+            // #3133: plan rows carry the intern-pass hash; only direct
+            // callers without a planner pay the sha256 here.
+            const hash = m.contentHash ?? sha256Hex(m.content);
+            const key = `${m.msgId}\u0000${hash}`;
+            let abs = seqByIdentity.get(key);
+            if (abs === undefined) {
+                abs = nextSeq++;
+                seqByIdentity.set(key, abs);
+            }
+            planToAbs.set(m.seq, abs);
+            return { ...m, seq: abs };
+        });
+        const remapSeqs = (seqs: number[] | null | undefined): number[] | null | undefined =>
+            seqs === null || seqs === undefined ? seqs : seqs.map((p) => planToAbs.get(p) ?? p);
+        const pluginSnapshotSeqs = remapSeqs(input.pluginSnapshotSeqs);
+        const tailSeqs = remapSeqs(input.tailSeqs);
+        const watermark = tailSeqs !== null && tailSeqs !== undefined && tailSeqs.length > 0 ? tailSeqs[tailSeqs.length - 1] : null;
+        s.tailJson = JSON.stringify({
+            ...(JSON.parse(s.tailJson) as Record<string, unknown>),
+            ...(pluginSnapshotSeqs !== undefined ? { pluginSnapshotSeqs } : {}),
+            ...(tailSeqs !== undefined ? { tailSeqs } : {}),
+        });
+        return { messages, watermark };
+    }
+
+    /** #3133: the session's ingest watermark — the absolute seq backing the
+     *  LAST message of the tail as ingested by the most recent save, plus
+     *  that save's trusted tailSeqs (same transaction wrote both). NULL (or
+     *  a shape that disagrees with tail_json — foreign write, partial
+     *  upgrade) means "no trusted prefix": the next save runs the full
+     *  ingest. Point read on the sessions PK. */
+    ingestWatermark(sessionId: string): { seq: number; tailSeqs: number[] } | null {
+        const row = this.db
+            .prepare("SELECT last_ingested_seq, tail_json FROM sessions WHERE session_id = ?")
+            .get(sessionId) as { last_ingested_seq: number | null; tail_json: string } | undefined;
+        if (!row) return null;
+        const seq = row.last_ingested_seq;
+        if (typeof seq !== "number" || !Number.isSafeInteger(seq) || seq < 0) return null;
+        const tail = JSON.parse(row.tail_json) as { tailSeqs?: number[] | null };
+        const seqs = tail.tailSeqs;
+        if (!Array.isArray(seqs) || seqs.length === 0 || seqs[seqs.length - 1] !== seq) return null;
+        return { seq, tailSeqs: seqs };
+    }
+
+    /** #3166 review (heal half of the sampled-verify backstop): drop the
+     *  durable watermark so the next save takes the exact full path and
+     *  re-points every tail slot. Called when the read-back digest proves
+     *  the stored prefix no longer matches the record of truth — without it
+     *  every same-length save would re-take the unverified empty delta
+     *  against a stale watermark and the divergence would be permanent. */
+    clearIngestWatermark(sessionId: string): void {
+        this.db.prepare("UPDATE sessions SET last_ingested_seq = NULL WHERE session_id = ?").run(sessionId);
+    }
+
+    /** #3133 boundary probe: the identity of the messages row at
+     *  (session_id, seq) plus the session's current max seq — both lookups
+     *  ride the PRIMARY KEY (session_id, seq) / idx_messages_session (no
+     *  full existing-rows scan, no seqByIdentity map). null when the row is
+     *  missing. The identity half is the trust decision; the max-seq half
+     *  is the ANCHOR delta appends continue after (max+1, the same
+     *  strictly-above discipline as the full path's remap, so appends can
+     *  never collide with an existing slot — rows above the watermark,
+     *  e.g. a fold's summary, are expected and harmless). */
+    probeIngestBoundary(sessionId: string, seq: number): { msgId: string; contentHash: string; maxSeq: number } | null {
+        const row = this.db
+            .prepare("SELECT msg_id, content_hash FROM messages WHERE session_id = ? AND seq = ?")
+            .get(sessionId, seq) as { msg_id: string; content_hash: string } | undefined;
+        if (!row) return null;
+        const max = this.db
+            .prepare("SELECT MAX(seq) AS m FROM messages WHERE session_id = ?")
+            .get(sessionId) as { m: number | null };
+        return { msgId: row.msg_id, contentHash: row.content_hash, maxSeq: max.m ?? -1 };
     }
 
     /** Deletes one session and releases every CAS refcount it holds
@@ -491,6 +738,7 @@ export class UnifiedStore {
             this.db.prepare("DELETE FROM refs WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM ccr_entries WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM conversations WHERE session_id = ?").run(sessionId);
+            this.db.prepare("DELETE FROM session_ext WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM sessions WHERE session_id = ?").run(sessionId);
             for (const hash of refs) this.releaseContent(hash);
             // CAS rows at zero refcount are unreferenced garbage — collect.
@@ -529,6 +777,110 @@ export class UnifiedStore {
         return sessionId
             ? (this.db.prepare(`SELECT ${cols} FROM checkpoints WHERE session_id = ? ORDER BY created_at, cp_id`).all(sessionId) as CheckpointRow[])
             : (this.db.prepare(`SELECT ${cols} FROM checkpoints ORDER BY created_at, cp_id`).all() as CheckpointRow[]);
+    }
+
+    // ------------------------------------------------------------------
+    // Extension namespaces (#3069 v4). Host/plugin/UI substrate — never
+    // kernel session state (that lives in kstate_json). Guards: key and
+    // namespace are non-empty printable strings <= 256 chars; the JSON
+    // payload is capped so a runaway caller cannot balloon index.db.
+    // ------------------------------------------------------------------
+
+    setSessionExt(sessionId: string, key: string, value: unknown): void {
+        validateExtKey(sessionId, "session id");
+        validateExtKey(key, "key");
+        const valueJson = serializeExtValue(value);
+        this.db
+            .prepare(
+                "INSERT INTO session_ext (session_id, key, value_json, updated_at) VALUES (?, ?, ?, ?) " +
+                    "ON CONFLICT (session_id, key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at",
+            )
+            .run(sessionId, key, valueJson, Date.now());
+    }
+
+    getSessionExt(sessionId: string, key: string): unknown {
+        validateExtKey(sessionId, "session id");
+        validateExtKey(key, "key");
+        const row = this.db
+            .prepare("SELECT value_json FROM session_ext WHERE session_id = ? AND key = ?")
+            .get(sessionId, key) as { value_json: string } | undefined;
+        return row === undefined ? undefined : JSON.parse(row.value_json);
+    }
+
+    listSessionExt(sessionId: string): { key: string; value: unknown; updatedAt: number }[] {
+        validateExtKey(sessionId, "session id");
+        return (
+            this.db
+                .prepare("SELECT key, value_json, updated_at FROM session_ext WHERE session_id = ? ORDER BY key")
+                .all(sessionId) as { key: string; value_json: string; updated_at: number }[]
+        ).map((r) => ({ key: r.key, value: JSON.parse(r.value_json), updatedAt: r.updated_at }));
+    }
+
+    /** Deletes one key (or every key of the session when omitted). Returns
+     *  the number of rows removed. The deleteSession sweep calls this table
+     *  too — session-bound state dies with the session. */
+    deleteSessionExt(sessionId: string, key?: string): number {
+        validateExtKey(sessionId, "session id");
+        if (key === undefined) {
+            return Number(this.db.prepare("DELETE FROM session_ext WHERE session_id = ?").run(sessionId).changes);
+        }
+        validateExtKey(key, "key");
+        return Number(this.db.prepare("DELETE FROM session_ext WHERE session_id = ? AND key = ?").run(sessionId, key).changes);
+    }
+
+    setKv(namespace: string, key: string, value: unknown): void {
+        validateExtKey(namespace, "namespace");
+        validateExtKey(key, "key");
+        const valueJson = serializeExtValue(value);
+        this.db
+            .prepare(
+                "INSERT INTO kv_store (namespace, key, value_json, updated_at) VALUES (?, ?, ?, ?) " +
+                    "ON CONFLICT (namespace, key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at",
+            )
+            .run(namespace, key, valueJson, Date.now());
+    }
+
+    getKv(namespace: string, key: string): unknown {
+        validateExtKey(namespace, "namespace");
+        validateExtKey(key, "key");
+        const row = this.db
+            .prepare("SELECT value_json FROM kv_store WHERE namespace = ? AND key = ?")
+            .get(namespace, key) as { value_json: string } | undefined;
+        return row === undefined ? undefined : JSON.parse(row.value_json);
+    }
+
+    listKv(namespace?: string, keyPrefix?: string): { namespace: string; key: string; value: unknown; updatedAt: number }[] {
+        const where: string[] = [];
+        const args: unknown[] = [];
+        if (namespace !== undefined) {
+            validateExtKey(namespace, "namespace");
+            where.push("namespace = ?");
+            args.push(namespace);
+        }
+        if (keyPrefix !== undefined && keyPrefix !== "") {
+            validateExtKey(keyPrefix, "key prefix");
+            where.push("key LIKE ? ESCAPE '\\'");
+            args.push(likeEscape(keyPrefix) + "%");
+        }
+        const sql =
+            "SELECT namespace, key, value_json, updated_at FROM kv_store" +
+            (where.length > 0 ? " WHERE " + where.join(" AND ") : "") +
+            " ORDER BY namespace, key";
+        return (
+            this.db.prepare(sql).all(...(args as never[])) as { namespace: string; key: string; value_json: string; updated_at: number }[]
+        ).map((r) => ({ namespace: r.namespace, key: r.key, value: JSON.parse(r.value_json), updatedAt: r.updated_at }));
+    }
+
+    /** Deletes one key of a namespace, or the whole namespace when the key
+     *  is omitted ("retire a lane" = deleteKv("lane:18835")). Returns the
+     *  number of rows removed. */
+    deleteKv(namespace: string, key?: string): number {
+        validateExtKey(namespace, "namespace");
+        if (key === undefined) {
+            return Number(this.db.prepare("DELETE FROM kv_store WHERE namespace = ?").run(namespace).changes);
+        }
+        validateExtKey(key, "key");
+        return Number(this.db.prepare("DELETE FROM kv_store WHERE namespace = ? AND key = ?").run(namespace, key).changes);
     }
 
     /** Sessions-row updated_at (ms epoch) — the ingest freshness watermark
@@ -797,7 +1149,7 @@ export class UnifiedStore {
             .prepare(
                 `SELECT session_id, parent_session_id, fork_point_seq, protocol, label, title, host_title, namespace, origin, status,
                         created_at, updated_at, next_block_id, next_run_id,
-                        meta_json, stats_json, metadata_json, kstate_json, tail_json, ccr_json
+                        meta_json, stats_json, metadata_json, kstate_json, tail_json, ccr_json, last_ingested_seq
                  FROM sessions WHERE session_id = ?`,
             )
             .get(sessionId) as Record<string, unknown> | undefined;
@@ -823,6 +1175,7 @@ export class UnifiedStore {
             kstateJson: row.kstate_json as string,
             tailJson: row.tail_json as string,
             ccrJson: (row.ccr_json as string | null) ?? null,
+            lastIngestedSeq: (row.last_ingested_seq as number | null | undefined) ?? null,
         };
     }
 

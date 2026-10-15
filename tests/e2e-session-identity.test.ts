@@ -160,6 +160,7 @@ async function startHarness(upstreamCount = 1): Promise<Harness> {
         upstreams,
         close: async () => {
             proxy.close();
+            proxy.closeIdleConnections?.();
             await once(proxy, "close");
             await Promise.all(upstreams.map((u) => u.close()));
         },

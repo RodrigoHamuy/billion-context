@@ -11,6 +11,7 @@ import { canonicalize, sha256 } from "./golden-canonical.ts";
 import { planIngest, loadLegacyView, toLegacyLike, type LegacySessionLike } from "../src/storage/ingest.ts";
 import { UnifiedStore } from "../src/storage/store.ts";
 import { resolveStorageMode } from "../src/storage/shadow.ts";
+import { resolveStorageWalJournalSizeLimit } from "../src/knobs.ts";
 import { setPreferredSqliteEngineForTests, type SqliteEngineName } from "../src/storage/driver.ts";
 
 /**
@@ -250,7 +251,15 @@ test("storage shadow (BILI_STORAGE_UNIFIED=1): real persist path double-writes a
                 loadStore.cancelAll();
 
                 const store = new SessionStore({ dir, debounceMs: 1, enabled: true });
+                // #3050 R3 ②a: writeNow folds an idle session's resident raw
+                // tail to the bounded view AFTER the save captures it — snapshot
+                // the live tail the shadow override actually received.
+                const liveTail = loaded.lastMessages;
+                const liveFolded = loaded.lastMessagesFolded === true;
                 await store.writeNow(loaded);
+                if (liveTail && liveTail.length > 0) {
+                    assert.equal(loaded.lastMessagesFolded, true, `${name}: idle save folds the resident tail`);
+                }
                 store.closeQuietly();
                 const unified = UnifiedStore.open(path.join(dir, "index.db"));
                 try {
@@ -272,18 +281,18 @@ test("storage shadow (BILI_STORAGE_UNIFIED=1): real persist path double-writes a
                     // storage-corpus.test.ts keep guarding the corpus itself.
                     const written = findWrittenRecord(dir, loaded.id, path.join(dir, name) + path.sep);
                     assert.ok(written, `${name}: persisted record not found after writeNow`);
-                    // #2960 ⑤: the ingest now receives the LIVE tail (raw / as
-                    // loaded), while the envelope keeps its bounded folded
-                    // re-render — the table is authoritative and richer, so
-                    // the oracle must compare against the same tail the
-                    // override handed the shadow, not the envelope's view.
+                    // #2960 ⑤ + R3 ②a caveat: the override is only handed the
+                    // LIVE RAW tail (lastMessagesFolded !== true). A session
+                    // loaded from disk carries the envelope's folded render
+                    // (folded=true), so the save presents the record's own
+                    // envelope view — the oracle must compare against exactly
+                    // what the override received, whichever that is.
+                    const overridePresent = !!liveTail && liveTail.length > 0 && liveFolded !== true;
                     assert.equal(
                         sessionDigest(loadLegacyView(rows)),
-                        recordDigest({
-                            ...written,
-                            messages: loaded.lastMessages,
-                            messagesFolded: loaded.lastMessagesFolded === true,
-                        }),
+                        overridePresent
+                            ? recordDigest({ ...written, messages: liveTail, messagesFolded: liveFolded })
+                            : recordDigest(written),
                         `${name}: shadow replay digest drift through the REAL write path`,
                     );
                     // Fixed point: re-load the written file and persist it
@@ -362,6 +371,29 @@ test("resolveStorageMode file tier: storage.unified applies when the env is abse
     // Env tier always wins, including explicit legacy-vs-full.
     assert.equal(resolveStorageMode({ BILI_STORAGE_UNIFIED: "full" }, "shadow"), "full");
     assert.equal(resolveStorageMode({ BILI_STORAGE_UNIFIED: "legacy" }, "full"), "legacy");
+});
+
+test("resolveStorageWalJournalSizeLimit: env wins, garbage falls through, file tier, default (#3250)", () => {
+    const DEFAULT = 8 * 1024 * 1024; // contract literal, mirrors tests/issue3250-wal-checkpoint.test.ts
+    assert.equal(resolveStorageWalJournalSizeLimit({}), DEFAULT, "absent everywhere must give the default cap");
+    assert.equal(
+        resolveStorageWalJournalSizeLimit({ BILI_STORAGE_WAL_JOURNAL_SIZE_LIMIT_BYTES: "67108864" }, DEFAULT),
+        67108864,
+        "env tier wins over the file tier",
+    );
+    assert.equal(
+        resolveStorageWalJournalSizeLimit({ BILI_STORAGE_WAL_JOURNAL_SIZE_LIMIT_BYTES: "1048576" }, 67108864),
+        1048576,
+        "env tier wins even when smaller than the file tier",
+    );
+    for (const bad of ["garbage", "", "0", "-1", "1.5"]) {
+        assert.equal(
+            resolveStorageWalJournalSizeLimit({ BILI_STORAGE_WAL_JOURNAL_SIZE_LIMIT_BYTES: bad }, 4096),
+            4096,
+            `env=${JSON.stringify(bad)} must fall through to the file tier (never crash boot)`,
+        );
+    }
+    assert.equal(resolveStorageWalJournalSizeLimit({}, 2097152), 2097152, "file tier applies when the env is absent");
 });
 
 test("storage unified FULL mode: read path serves from the index with organic import + GC parity", async () => {
@@ -706,7 +738,7 @@ test("schema v2: dev-window v1 database upgrades in place (identity columns adde
             assert.equal(row!.namespace, "proxy", "namespace backfills with its constant default");
             assert.equal(row!.origin, null, "origin backfills NULL");
             const ver = (store as unknown as { db: { prepare(q: string): { get(): unknown } } }).db.prepare("PRAGMA user_version").get() as { user_version: number };
-            assert.equal(ver.user_version, 3, "schema version stamped to 3 (v2 columns + v3 identity index)");
+            assert.equal(ver.user_version, 5, "schema version stamped to 5 (v2 columns + v3 identity index + v4 extension namespaces + v5 watermark column)");
             // v3 backfill: every pre-existing sessions row claims its
             // (namespace, conversation_id) identity binding.
             const binding = (store as unknown as { lookupConversation(ns: string, id: string): string | null }).lookupConversation("proxy", "dev-window-1");

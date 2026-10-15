@@ -276,23 +276,45 @@ export function dshLedgerFloorTokens(metadata: Record<string, unknown> | undefin
 }
 
 // Only override genuine cadence silences — never the kernel's deliberate
-// "nothing worth offering" suppressions. #2104: that includes the NON-empty
-// kind: decideNudge suppresses while compressibleRanges still carries the raw
-// list (reason "max compressible < threshold" / "max pending < min benefit" —
-// every range below minCompressRange). "List non-empty" used to read as
-// "worth advertising", so past the escalation line the override injected a
-// nudge whose range list compress would atomically reject — the
-// nudge-vs-compress/acp_status contradiction of #2104, which fed a
-// compress-loop (4 rejected/burned calls in 9 steps). Gate the override on
-// the SAME submit gate compress applies — chars >= minCompressRange (#847,
-// the postCompressTail/handleAcpStatus filter, mirroring the kernel's own
-// pendingByTier expression): the emergency line may only advertise ranges
-// that are executable. minCompressRange 0 (default) preserves the legacy
-// any-non-empty-list semantics for direct callers.
+// "nothing worth offering" suppressions. Two independent grounds, each pinned
+// by its own issue:
+//
+// #2104 (submit-gate feasibility): decideNudge suppresses while
+// compressibleRanges still carries the raw list (reason "max compressible <
+// threshold" / "max pending < min benefit" — every range below
+// minCompressRange). "List non-empty" used to read as "worth advertising", so
+// past the escalation line the override injected a nudge whose range list
+// compress would atomically reject — the nudge-vs-compress/acp_status
+// contradiction of #2104, which fed a compress-loop (4 rejected/burned calls
+// in 9 steps). Gate the override on the SAME submit gate compress applies —
+// chars >= minCompressRange (#847, the postCompressTail/handleAcpStatus
+// filter, mirroring the kernel's own pendingByTier expression): the emergency
+// line may only advertise ranges that are executable. minCompressRange 0
+// (default) preserves the legacy any-non-empty-list semantics for direct
+// callers.
+//
+// #3006 (net-benefit floor): this line sits INSIDE the kernel's non-pressure
+// band (below its maxContextLimitPct over-limit line), where the kernel's
+// refusal grounds are cadence/mass ("growth < floor", "max compressible <
+// threshold") rather than benefit — so "shouldInject=false + an executable
+// range exists" read as "worth forcing" even when the largest executable
+// range was below the kernel's OWN minimum-benefit floor, the one it applies
+// even in its pressure band (#198). Near-boundary sessions then folded in
+// zero-yield loops: each sub-benefit fold rewrites the prefix from the fold
+// anchor onward (observed ~65k tokens / ~60s of cache-miss reprocessing per
+// fold), reclaims almost nothing, drops usage just under the line, and
+// re-arms within a few turns. The override now requires the SAME pair the
+// kernel's pressure branch compares — breakdown.maxPending vs
+// breakdown.minPressureBenefit: the host may only advertise early what the
+// kernel itself would accept under pressure. Hand-built decisions without
+// those breakdown fields keep the pre-fix semantics (legacy fallback).
 export function emergencyNudge(nudge: NudgeDecision | null | undefined, escalationPct: number = EMERGENCY_NUDGE_ESCALATION_PCT, minCompressRange: number = 0): boolean {
     if (!nudge || nudge.shouldInject) return false;
     if (nudge.contextUsage < escalationPct) return false;
-    return nudge.compressibleRanges.some((r) => minCompressRange <= 0 || (r.chars ?? r.tokens * 4) >= minCompressRange);
+    if (!nudge.compressibleRanges.some((r) => minCompressRange <= 0 || (r.chars ?? r.tokens * 4) >= minCompressRange)) return false;
+    const b = nudge.breakdown;
+    const minBenefit = b?.minPressureBenefit;
+    return !(typeof minBenefit === "number" && Number.isFinite(minBenefit) && minBenefit > 0 && (b.maxPending ?? 0) < minBenefit);
 }
 
 export function clampOutgoingOutput(
@@ -314,10 +336,14 @@ export function clampOutgoingOutput(
      *  planning basis only ever tightens the cap (fail-closed direction). */
     ledgerFloorTokens?: number;
      /** #2122/#1933 F1: per-route estimator calibration — scales the local-est
-      *  side of estimateInputTokens so the clamp judges the payload on the same
-      *  provider-billed scale as preflight/nudge. Absent → legacy raw behavior. */ kFactor?: number; kOrigin?: string; origin?: string },
+       *  side of estimateInputTokens so the clamp judges the payload on the same
+       *  provider-billed scale as preflight/nudge. Absent → legacy raw behavior. */ kFactor?: number; kOrigin?: string; origin?: string },
     sessionId: string,
     log: (level: string, msg: string) => void,
+    /** #3148: optional visibility hook — invoked with the exact clamp event when
+     *  a cap is applied (callers record it on session.stats for acp_status).
+     *  Never affects the wire decision. */
+    onClamped?: (info: { raw: number; capped: number; window: number; planningInput: number; ledgerFloor: number }) => void,
 ): void {
     const raw = readOutputBudget(rebuilt, field);
     if (typeof raw !== "number") return;
@@ -343,5 +369,6 @@ export function clampOutgoingOutput(
         // rescue right before the turn dies.
         const overTarget = ctx.headroomWindow !== undefined && ctx.headroomWindow < ctx.nativeWindow && planningInput >= ctx.headroomWindow;
         log("info", `[${sessionId}] output budget clamped ${raw} -> ${capped} (input~${inputEstimate}${ledgerFloor > inputEstimate ? `, planning floor ${ledgerFloor} from the refused dsh compaction replay (#2490)` : ""}, window=${ctx.nativeWindow}); prevents input+output overflow (#453)${overTarget ? `; input already exceeds the headroom-adjusted target ~${ctx.headroomWindow} that nudge/preflight enforce — only compression can recover it, this clamp guarantees native-window fit only (#2096)` : ""}`);
+        onClamped?.({ raw, capped, window: ctx.nativeWindow, planningInput, ledgerFloor });
     }
 }

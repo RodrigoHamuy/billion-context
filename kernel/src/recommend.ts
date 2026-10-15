@@ -60,9 +60,17 @@ function isSyntheticOrPruned(
  * Compute the set of protected message refs (mNNNNN) that form the
  * "soft-protected zone" at the tail of the conversation.
  *
- * Combines two rules:
+ * Combines three rules:
  *   1. Last N messages (`config.preserveRecentMessages`)
  *   2. Last N tokens expanding backward (`config.preserveRecentTokens`)
+ *   3. Last visible user message (couples to Rule 1)
+ *
+ * Then closes the tool-pair gap (#2886): if either half of a (tool-call,
+ * tool-result) pair is protected, both are. Without this, `neverPreserveRecentTools`
+ * excludes list-matching results from `visible` while their paired call stays
+ * protectable, so the zone can hold the call but not its result — the advisory
+ * carve keeps the call visible and folds the result, stranding an orphan
+ * function_call that strict Responses validators reject (HTTP 400).
  *
  * Only considers visible, non-synthetic, non-pruned messages that have refs.
  */
@@ -136,6 +144,43 @@ export function computeProtectedRefs(
       const ref = state.messageRefs.byRaw[msg.id];
       if (ref && ref !== "BLOCKED") result.add(ref);
       break;
+    }
+  }
+
+  // #2886: close the tool-pair gap. neverPreserveRecentTools drops big-result
+  // tools (read/bash/...) from `visible`, so a matching tool-result can never
+  // enter the recent zone while its paired tool-call (unmatched name) can.
+  // Rules 1/2 above may then protect the call but not the result; the advisory
+  // carve keeps the call visible and folds the result, stranding an orphan
+  // function_call that strict Responses validators reject (HTTP 400). Make the
+  // zone symmetric per pair: if either half is protected, protect both. This is
+  // monotonic (only adds refs), so it cannot shrink any previously-protected set.
+  {
+    const msgByRef = new Map<string, CoreMessage>();
+    for (const m of messages) {
+      const ref = m.id ? state.messageRefs.byRaw[m.id] : undefined;
+      if (ref && ref !== "BLOCKED") msgByRef.set(ref, m);
+    }
+    const callRefByToolCallId = new Map<string, string>();
+    const resultRefByToolCallId = new Map<string, string>();
+    for (const m of messages) {
+      if (!m.id || typeof m.toolCallId !== "string") continue;
+      if (isSyntheticOrPruned(m, covered)) continue;
+      const ref = state.messageRefs.byRaw[m.id];
+      if (!ref || ref === "BLOCKED") continue;
+      if (m.contentType === "tool-call") callRefByToolCallId.set(m.toolCallId, ref);
+      else if (m.contentType === "tool-result") resultRefByToolCallId.set(m.toolCallId, ref);
+    }
+    for (const ref of [...result]) {
+      const m = msgByRef.get(ref);
+      if (!m || typeof m.toolCallId !== "string") continue;
+      if (m.contentType === "tool-call") {
+        const r = resultRefByToolCallId.get(m.toolCallId);
+        if (r) result.add(r);
+      } else if (m.contentType === "tool-result") {
+        const c = callRefByToolCallId.get(m.toolCallId);
+        if (c) result.add(c);
+      }
     }
   }
 

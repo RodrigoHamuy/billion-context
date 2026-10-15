@@ -70,6 +70,13 @@ export interface PruneOptions {
    * provider prefix-cache head (#2733).
    */
   headSummaryAnchors?: boolean;
+  /**
+   * Names that count as a `compress` call for the pending-call exemption in
+   * orphan stripping (same predicate family as Config.isCompressTool). Unset =
+   * bare-name only, byte-identical to before; without it an MCP-form compress
+   * call still awaiting its result is deleted while its bare-name twin survives.
+   */
+  isCompressTool?: (toolName: string) => boolean;
 }
 
 export function prune(
@@ -83,6 +90,8 @@ export function prune(
   for (const id of covered) coveredBases.add(baseIdOf(id));
 
   const inject = options.injectSummaries ?? true;
+  const isCompressTool =
+    options.isCompressTool ?? ((name: string) => name === "compress");
   const firstUserIndex = messages.findIndex(
     (message) => message.role === "user",
   );
@@ -129,6 +138,7 @@ export function prune(
           knownSummaryIds,
           options.headSummaryAnchors === true,
         ),
+        isCompressTool,
       ),
     ),
   );
@@ -404,7 +414,10 @@ function stripOrphanedToolResults(messages: CoreMessage[]): CoreMessage[] {
   );
 }
 
-function stripOrphanedToolCalls(messages: CoreMessage[]): CoreMessage[] {
+function stripOrphanedToolCalls(
+  messages: CoreMessage[],
+  isCompressTool: (toolName: string) => boolean,
+): CoreMessage[] {
   const knownResultIds = new Set<string>();
   for (const m of messages) {
     if (m.contentType === "tool-result" && m.toolCallId) {
@@ -415,7 +428,7 @@ function stripOrphanedToolCalls(messages: CoreMessage[]): CoreMessage[] {
     (m) =>
       m.contentType !== "tool-call" ||
       !m.toolCallId ||
-      m.toolName === "compress" ||
+      (typeof m.toolName === "string" && isCompressTool(m.toolName)) ||
       knownResultIds.has(m.toolCallId),
   );
 }

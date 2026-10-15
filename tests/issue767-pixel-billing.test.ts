@@ -327,8 +327,10 @@ test("e2e #767: pixels billing recovers a stale-baseline session the bytes estim
         assert.equal(stats.imagesSeen, 4);
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });
@@ -363,8 +365,10 @@ test("e2e #767 control: explicit bytes route still fails fast — relay protecti
         assert.equal(stats.imagesSeen, 0, "over-window images never reached the upstream");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });
@@ -403,8 +407,10 @@ test("e2e #1843: default route (auto→pixels) forwards an image-heavy payload t
         assert.ok(after.stats.lastInputTokens > 0 && after.stats.lastInputTokens < WINDOW, `baseline recovered to real usage (got ${after.stats.lastInputTokens})`);
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });
@@ -440,8 +446,10 @@ test("e2e #767: learned-limit-only variant also closes forward-once (explicit by
         assert.equal(stats.imagesSeen, 0);
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });
@@ -479,8 +487,10 @@ test("e2e #767: env BILI_IMAGE_BILLING beats per-provider route config", async (
         assert.equal(stats.imagesSeen, 0);
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });
@@ -517,8 +527,10 @@ test("e2e #767: per-route imageBilling applies under a path-qualified provider k
         assert.ok(after.stats.lastInputTokens > 0 && after.stats.lastInputTokens < WINDOW, `baseline recovered to real usage (got ${after.stats.lastInputTokens})`);
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });

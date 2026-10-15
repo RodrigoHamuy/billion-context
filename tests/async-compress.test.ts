@@ -21,6 +21,7 @@ const { _setForTest: setRegistryForTest } = await import("../src/registry.ts");
 const { listSessions, _resetSessionsForTest, flushAllSessions } = await import("../src/session.ts");
 const { _resetPluginStateForTest } = await import("../src/plugin.ts");
 const ac = await import("../src/async-compress.ts");
+const { recordUpstreamCircuitFailure, _resetUpstreamCircuitsForTest } = await import("../src/upstream-alerts.ts");
 type ProxyOptions = import("../src/config.ts").ProxyOptions;
 
 after(() => {
@@ -454,6 +455,39 @@ async function queueAndCapture(rig: Rig, sid: string, h: unknown[]): Promise<{ t
     await chat(rig, sid, withResult, true, PLUGIN_TOOLS);
     return { tag, withResult };
 }
+
+test("#3148 merge: an open upstream circuit fails fast before capture — the queued job is neither captured nor left running, and captures once the circuit closes", async () => {
+    ac.configureAsyncCompress({});
+    freshStore();
+    _resetUpstreamCircuitsForTest();
+    const rig = await startRig();
+    try {
+        const sid = "circuit-open";
+        const h = history(12);
+        await chat(rig, sid, [...h, { role: "user", content: "go on" }], true, PLUGIN_TOOLS);
+        const queued = await pluginTool(rig, sid, "compress", { content: [] });
+        assert.match(queued.result ?? "", /job bg-[0-9a-f]+/);
+        const withResult = [...h, { role: "user", content: "go on" },
+            { role: "assistant", content: null, tool_calls: [{ id: "call_c", type: "function", function: { name: "compress", arguments: "{\"content\":[]}" } }] },
+            { role: "tool", tool_call_id: "call_c", content: queued.result }];
+        const refused = Object.assign(new Error("connect ECONNREFUSED 127.0.0.1:1"), { code: "ECONNREFUSED" });
+        for (let i = 0; i < 3; i++) recordUpstreamCircuitFailure(rig.base.slice(rig.base.indexOf("/bili/") + 6), refused, false);
+        const before = rig.seen.length;
+        const blocked = await chat(rig, sid, withResult, true, PLUGIN_TOOLS);
+        assert.ok(blocked.status >= 500 || /upstream circuit open/.test(blocked.text), `fails fast: ${blocked.status} ${blocked.text.slice(0, 200)}`);
+        assert.equal(rig.seen.length, before, "upstream not contacted: no main send, no background pass");
+        const job = [...ac._asyncCompressStateForTest().jobs.values()].find((j) => j.sessionId === sessionFor(sid)!.id);
+        assert.equal(job?.phase, "awaiting-capture", "not captured, not running");
+
+        _resetUpstreamCircuitsForTest();
+        await chat(rig, sid, withResult, true, PLUGIN_TOOLS);
+        await waitFor(() => [...ac._asyncCompressStateForTest().jobs.values()].some((j) => j.sessionId === sessionFor(sid)!.id && j.phase === "ready"));
+        assert.equal(rig.seen.filter((s) => s.fork).length, 1, "exactly one background pass after the circuit closes");
+    } finally {
+        _resetUpstreamCircuitsForTest();
+        await closeRig(rig);
+    }
+});
 
 function notesIn(rig: Rig, from: number, tag: string): number {
     return rig.seen.slice(from).filter((s) => !s.fork && s.body.includes(`job ${tag} did not apply`)).length;

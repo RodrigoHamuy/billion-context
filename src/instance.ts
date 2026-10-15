@@ -165,6 +165,28 @@ export function findSameLanePredecessor(
     return undefined;
 }
 
+/** #3044 follow-up: a live holder on the same lane running OUR build — a
+ *  twin, not a predecessor. Nothing is draining (it is healthy and serving),
+ *  so waiting cannot help; laddering +1 strands the newcomer as an orphan
+ *  nobody routes to while the twin keeps serving (the second trigger path of
+ *  #3044: a host respawn racing a live instance). The newcomer must exit
+ *  loudly instead — the duplicate loses, the serving instance wins. Missing
+ *  fingerprints never match: an unknown build is not our twin. */
+export function findSameLaneTwin(
+    entries: RegistryEntry[],
+    port: number,
+    lane: string | undefined,
+    ownFingerprint: string | undefined,
+): RegistryEntry | undefined {
+    if (!lane || !ownFingerprint) return undefined;
+    for (const e of entries) {
+        if (e.port !== port || e.lane !== lane) continue;
+        if (!isPidAlive(e.pid)) continue;
+        if (e.codeFingerprint === ownFingerprint) return e;
+    }
+    return undefined;
+}
+
 /** #1225: content identity of a bili entry script (sha256 of its bytes).
  *  The spawned child records this for ITS script; an attaching launcher
  *  compares it against the hash of the script it would spawn — so "same

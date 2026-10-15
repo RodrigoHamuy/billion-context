@@ -44,6 +44,7 @@ async function withUpstream(run: (url: string, mainCalls: () => number) => Promi
     } finally {
         const closed = once(server, "close");
         server.close();
+        server.closeIdleConnections?.();
         server.closeAllConnections();
         await closed;
     }
@@ -163,6 +164,7 @@ for (const pluginMode of [false, true]) {
                 client.destroy();
                 const closed = once(downstream, "close");
                 downstream.close();
+                downstream.closeIdleConnections?.();
                 downstream.closeAllConnections();
                 await closed;
             }

@@ -149,8 +149,10 @@ const NUDGE_HINT = "ONE call, ONE string"; // rides every rendered nudge (ONE_CA
 
 async function closeRig(rig: Rig): Promise<void> {
     rig.proxy.close();
+    rig.proxy.closeIdleConnections?.();
     await once(rig.proxy, "close");
     rig.upstream.close();
+    rig.upstream.closeIdleConnections?.();
     await once(rig.upstream, "close");
 }
 

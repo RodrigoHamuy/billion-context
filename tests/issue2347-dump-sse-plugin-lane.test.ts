@@ -66,7 +66,7 @@ async function harness(opts: { dumpDir?: string; injectTool: boolean }): Promise
         close: async () => {
             store.cancelAll();
             const closed = Promise.all([once(proxy, "close"), once(upstream, "close")]);
-            proxy.close(); upstream.close();
+            proxy.close(); proxy.closeIdleConnections?.(); upstream.close(); upstream.closeIdleConnections?.();
             await closed;
         },
     };

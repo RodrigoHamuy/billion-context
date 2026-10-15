@@ -112,7 +112,7 @@ async function harness(persist = false, seedParent = true, compressExtra: Record
         assert.equal(r.status, 200);
         await r.text();
     }
-    return { request, messages, forwarded, dir, store, upstreamUrl, origin, close: async () => { store.cancelAll(); proxy.close(); upstream.close(); await Promise.all([once(proxy, "close"), once(upstream, "close")]); } };
+    return { request, messages, forwarded, dir, store, upstreamUrl, origin, close: async () => { store.cancelAll(); proxy.close(); upstream.close(); proxy.closeIdleConnections?.(); upstream.closeIdleConnections?.(); await Promise.all([once(proxy, "close"), once(upstream, "close")]); } };
 }
 
 test("plain proxy panel snapshots do not change raw-history persistence", async () => {
@@ -1033,7 +1033,12 @@ test("HTTP nested summaries expand crossing ancestors and retain independent ori
         assert.equal(exact.body.inheritedBlocks.length, 2);
         const restored = h.store.loadSync("nested")!;
         assert.deepEqual(restored.state.blocks, JSON.parse(JSON.stringify(resolveConversation("nested").session!.state.blocks)));
-        assert.deepEqual(restored.blockContents, resolveConversation("nested").session!.blockContents);
+        // #3050 R3 ②b: idle saves swap the resident map to the lazy shell —
+        // compare CONTENT (materialized) instead of the map constructor.
+        assert.deepEqual(
+            Object.fromEntries(restored.blockContents),
+            Object.fromEntries(resolveConversation("nested").session!.blockContents),
+        );
         const expanded = await h.request("/__bili/plugin/fork", forkRequest(snapshot, "nested-prefix", 2));
         assert.equal(expanded.status, 201, JSON.stringify(expanded.body));
         assert.equal(expanded.body.status, "expanded");

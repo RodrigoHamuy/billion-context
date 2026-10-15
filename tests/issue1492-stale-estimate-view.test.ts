@@ -192,8 +192,10 @@ async function runCase(sessionId: string, poisonSource: "usage" | "estimate", co
     } finally {
         setLogCapture(null);
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         relay.server.close();
+        relay.server.closeIdleConnections?.();
         await once(relay.server, "close");
     }
 }

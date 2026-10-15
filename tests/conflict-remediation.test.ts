@@ -67,6 +67,8 @@ test("conflictRemediation: one line per known client, generic fallback for the r
     assert.ok(cl.includes("bili claude"), cl);
     const cx = conflictRemediation("codex");
     assert.ok(cx.includes("BILI_CODEX_COMPACT=intercept"), cx);
+    assert.ok(cx.includes("#3008"), cx);
+    assert.ok(!cx.includes("never transits"), "#3008: the inline auto-compact DOES transit as an ordinary turn — the old copy was false");
     assert.equal(conflictRemediation("pi"), conflictRemediation("omp"), "pi and omp share the carriage-evidence hint");
     assert.ok(conflictRemediation("pi").includes("report client + bili version"));
     const gen = conflictRemediation(undefined);

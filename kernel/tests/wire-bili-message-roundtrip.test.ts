@@ -13,7 +13,9 @@ import type {
 } from "../src/wire/anthropic.js";
 import type { OpenAIRequestBody } from "../src/wire/openai.js";
 import type {
+  ResponseContentPart,
   ResponseInputItem,
+  ResponseInputMessage,
   ResponsesRequestBody,
 } from "../src/wire/responses.js";
 
@@ -617,6 +619,51 @@ test("responses: image-only item survives patchResponsesInput and prunes with it
     !JSON.stringify(pruned).includes(DATA_URL),
     "pruning the id removes the image from the rebuild",
   );
+});
+
+// 6c-bis (#3089). A user message with >=2 input_text parts and an image between
+// them (text | image | text) must NOT be rebuilt with an empty trailing
+// input_text part when its .text changes on re-send (per-turn ref-tag render).
+// Strict Responses backends reject empty input_text.text: 400 "text is required".
+test("responses: multi-text-part + image rebuild emits no empty input_text (#3089)", () => {
+  const body: ResponsesRequestBody = {
+    input: [
+      {
+        type: "message",
+        role: "user",
+        content: [
+          { type: "input_text", text: "look at this" },
+          { type: "input_image", image_url: DATA_URL },
+          { type: "input_text", text: "describe it" },
+        ],
+      },
+    ],
+  };
+  const proj = responsesToCore(body);
+  assert.equal(proj.msgs.length, 1, "single user message tracked");
+  const src = proj.msgs[0]!;
+  // Mutate .text to force patchOriginalItem onto the patchTextParts path.
+  const next = [{ ...src, text: `${src.text}\n[m00001]` }];
+  const rebuilt = patchResponsesInput(proj, next) as ResponseInputItem[];
+  const item = rebuilt.find((i) => i.type === "message") as ResponseInputMessage;
+  const content = item.content as ResponseContentPart[];
+  for (const part of content) {
+    if (part.type === "input_text" || part.type === "output_text") {
+      assert.notEqual(
+        part.text,
+        "",
+        "no empty input_text part after rewrite (#3089)",
+      );
+    }
+  }
+  const textParts = content.filter(
+    (p): p is { type: "input_text" | "output_text"; text: string } =>
+      p.type === "input_text" || p.type === "output_text",
+  );
+  assert.equal(textParts.length, 1, "secondary text slots dropped, not blanked");
+  assert.match(textParts[0]!.text, /look at this/, "first slot keeps all text");
+  assert.match(textParts[0]!.text, /describe it/, "first slot keeps all text");
+  assert.ok(content.some((p) => p.type === "input_image"), "image preserved in place");
 });
 
 // 6d. Two identical image-only items must get distinct but STABLE ids across

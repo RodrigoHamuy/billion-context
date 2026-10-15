@@ -45,6 +45,11 @@ export interface WsBridgeContext {
     dispatch: (req: http.IncomingMessage, res: http.ServerResponse) => Promise<void>;
     /** The codec that claimed this upgrade (per-protocol transport policy). */
     codec: WsBridgeCodec;
+    /** #300/#3073: this server's per-instance identity. Codecs that own their
+     *  upstream WebSocket transport stamp it into x-bili-hop on EVERY upstream
+     *  handshake — probe and turns alike — so a chained bili sees one
+     *  consistent processor marker instead of marker-less probes. */
+    instanceId?: string;
 }
 
 export interface WsBridgeCodec {
@@ -83,6 +88,8 @@ export function installWebSocketBridge(
     codecs: readonly WsBridgeCodec[],
     /** #2124: whether a WS-upstream destination's egress leaves through an upstream proxy (its hostname is then resolved remotely by that proxy, not the local resolver). */
     isEgressProxied?: (destinationUrl: string) => boolean,
+    /** #300/#3073: this server's per-instance identity for the x-bili-hop chain stamp (see WsBridgeContext.instanceId). */
+    instanceId?: string,
 ): (req: http.IncomingMessage, socket: Duplex, head: Buffer) => boolean {
     const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_REQUEST_BYTES, perMessageDeflate: false });
     const sessions = new Set<{ session: WsBridgeSession; peer: WebSocket }>();
@@ -129,7 +136,7 @@ export function installWebSocketBridge(
             wss.handleUpgrade(source, socket, head, peer => {
                 const label = `[${codec.name}] [conn=${++connectionId}] [session=${JSON.stringify(conversationId.slice(0, 128))}]`;
                 const trace: WsBridgeLog = (level, message) => log(level, `${label} ${message}`);
-                const session = codec.createSession({ log: trace, peer, source, upstreamUrl: upstream, dispatch, codec });
+                const session = codec.createSession({ log: trace, peer, source, upstreamUrl: upstream, dispatch, codec, instanceId });
                 const entry = { session, peer };
                 sessions.add(entry);
                 peer.on("error", () => {});

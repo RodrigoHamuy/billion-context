@@ -152,8 +152,10 @@ test("#2733: codex client → summary payload carries the real CLI wire shape; s
         assert.ok((sess!.state.blocks ?? []).some((b) => b.active), "the preflight fold landed on the session");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });
@@ -183,8 +185,10 @@ test("#2733: non-codex client → summary payload stays the legacy minimal shape
             `non-codex clients must keep the legacy minimal shape (no typed items, no include), got ${JSON.stringify(summaryCalls)}`);
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });

@@ -201,7 +201,9 @@ test("changed over-window content bypasses a previous dead-end cooldown", async 
         assert.ok(calls.length > callsBefore, "changed content must retry preflight even at the same length/model/window");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         upstream.close();
+        upstream.closeIdleConnections?.();
         await Promise.all([once(proxy, "close"), once(upstream, "close")]);
     }
 });
@@ -238,7 +240,9 @@ test(`temporary summary HTTP ${status} failure does not cache a deterministic de
         assert.ok(calls > callsBefore, "next request must reach the upstream");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         upstream.close();
+        upstream.closeIdleConnections?.();
         await Promise.all([once(proxy, "close"), once(upstream, "close")]);
     }
 });
@@ -277,7 +281,9 @@ test("#726 size-driven empty summary: oversized chunk fails, halved chunk recove
         assert.equal(sess?.metadata?.preflightDeadEnd, undefined, "successful preflight must not leave a dead-end marker");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         upstream.close();
+        upstream.closeIdleConnections?.();
         await new Promise<void>((resolve, reject) => {
             void Promise.allSettled([once(proxy, "close"), once(upstream, "close")]).then(() => resolve(), reject);
         });
@@ -332,7 +338,9 @@ test("#726 systemic empty summary: diagnosis surfaced, bounded calls, cooldown b
         assert.ok(calls.length > callsBeforeExpire, "after the cooldown expires the walk must run again");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         upstream.close();
+        upstream.closeIdleConnections?.();
         await new Promise<void>((resolve, reject) => {
             void Promise.allSettled([once(proxy, "close"), once(upstream, "close")]).then(() => resolve(), reject);
         });
@@ -372,7 +380,9 @@ test("#726 dead-end cooldown must not block safe-forwards: fitting payload under
         assert.ok(calls.length > callsBeforeSmall && calls[calls.length - 1].summary === false, "the small payload was forwarded to the upstream");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         upstream.close();
+        upstream.closeIdleConnections?.();
         await new Promise<void>((resolve, reject) => {
             void Promise.allSettled([once(proxy, "close"), once(upstream, "close")]).then(() => resolve(), reject);
         });
@@ -480,7 +490,9 @@ test("#780 truncated summary stream is unusable: diagnosis names truncation, bou
         assert.equal(calls.length, callsBeforeRetry, "cooldown must spend ZERO upstream calls");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         upstream.close();
+        upstream.closeIdleConnections?.();
         await new Promise<void>((resolve, reject) => {
             void Promise.allSettled([once(proxy, "close"), once(upstream, "close")]).then(() => resolve(), reject);
         });

@@ -104,8 +104,10 @@ async function startRig(compress: { injectTool: boolean; injectNudge?: boolean }
         bodies,
         close: async () => {
             proxy.close();
+            proxy.closeIdleConnections?.();
             await once(proxy, "close");
             upstream.close();
+            upstream.closeIdleConnections?.();
             await once(upstream, "close");
         },
     };

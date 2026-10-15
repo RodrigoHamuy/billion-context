@@ -63,6 +63,17 @@ export const MAX_SUMMARY_CALLS_PER_PREFLIGHT = 16;
 // only queue inside the same pass. Ranges past the cap fold through the
 // serial walk in later rounds exactly as before.
 const MAX_PREFLIGHT_SUMMARY_BATCH = 4;
+// #2952 Design A: bounded tier-distillation recovery. When raw-range folding
+// alone cannot close the window gap but distilling existing lower-tier BLOCKS
+// (T1->T2, T2->T3) can, preflight performs the distillation ITSELF — the model
+// is blocked from doing it because its next turn is refused by this very
+// fail-fast (the deadlock reported in #2952). Hard caps keep it bounded: at most
+// MAX_TIER_DISTILL_CALLS summary calls per invocation, and each call's source
+// content is capped (TIER_DISTILL_SOURCE_CHAR_BUDGET) so one recovery cannot
+// bill an unbounded prompt. Never entered for tiers=false or emergency digest
+// mode (no LLM lane), so those paths stay byte-identical.
+const MAX_TIER_DISTILL_CALLS = 6;
+const TIER_DISTILL_SOURCE_CHAR_BUDGET = 60_000;
 // #1819: net-shrink monotonicity tolerance for fold acceptance. A weak
 // summarizer can regurgitate a verbose re-narration that EXCEEDS its own
 // range: the flat maxSummaryLength cap bounds absolute size only, so such a
@@ -1082,14 +1093,15 @@ export function describeExternalSummaryFailure(batch: ExternalSummaryBatchResult
     return parts.join(" ");
 }
 
-async function summarizeRange(deps: PreflightDeps, content: string, startRef: string, endRef: string, lengthBudget?: number): Promise<SummaryOutcome> {
+async function summarizeRange(deps: PreflightDeps, content: string, startRef: string, endRef: string, lengthBudget?: number, systemOverride?: string): Promise<SummaryOutcome> {
     // #1775: the cap used to be enforced only after the fact — an over-cap
     // assembly was discarded wholesale (the #1775 incident). Tell the model the
     // character budget up front so the first attempt already fits. Below
     // MIN_SUMMARY_CHARS the instruction would be counterproductive (the kernel
     // minimum-summary gate rejects such output anyway), so omit it.
-    const system =
-        buildCompressSystemPrompt(deps.prompts, deps.surface?.promptSections) +
+    // #2952: systemOverride carries a tier-distillation TASK (T2/T3 rules) in
+    // place of the default tier-1 TASK; absent → byte-identical default below.
+    const system = systemOverride ?? buildCompressSystemPrompt(deps.prompts, deps.surface?.promptSections) +
         `\n\nTASK: The conversation segment below (messages ${startRef}–${endRef}) must be compressed because the session context exceeds the current model's window. Write a tier-1 compression summary of the segment following every rule above. Output ONLY the summary text — no preamble, no closing remarks, no tool calls.` +
         (lengthBudget !== undefined && lengthBudget >= MIN_SUMMARY_CHARS
             ? `\n\nLENGTH BUDGET: Your ENTIRE response must be AT MOST ${lengthBudget} characters total — longer output is rejected by the pipeline. Be dense: compact bullets, no filler or repetition.`
@@ -1558,6 +1570,170 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
     if (emergencyFold) {
         deps.log("warn", `[preflight] payload ~${entryLocal} tok vs window ${limit} (~${entryOvershoot.toFixed(1)}x) exceeds the LLM fold path's coverage bound (${EMERGENCY_FOLD_COVERAGE}x) — folding with deterministic digests instead of summarization calls; originals stay restorable via decompress (#2383)`);
     }
+    // #2952 Design A: bounded tier-distillation recovery (caps + rationale in
+    // the constant comments above). The gates below DEFER their terminal verdict
+    // here when raw-range folding cannot close the gap but merging existing
+    // lower-tier blocks might; the post-walk funnel is the single execution point
+    // so every exhaustion path (deferred gate, mid-walk bail, natural exhaustion)
+    // gets exactly one bounded chance before any fail-fast verdict is final.
+    const tiersEnabled = (deps.config as ResolvedKernelConfig).tiers?.enabled !== false;
+    let tierRecoveryAttempted = false;
+    const eligibleForTierRecovery = (): boolean => {
+        if (!tiersEnabled || tierRecoveryAttempted || deps.signal?.aborted || emergencyFold) return false;
+        if (summaryCalls >= summaryBudget) return false;
+        const active = deps.session.state.blocks.filter((b) => b.active);
+        return active.filter((b) => b.tier === 1).length >= 2 || active.filter((b) => b.tier === 2).length >= 2;
+    };
+    type TierRecoveryResult = { recovered: boolean; callsUsed: number; netSaved: number; honestDetail: string };
+    const attemptTierRecovery = async (): Promise<TierRecoveryResult> => {
+        let callsUsed = 0;
+        let netSaved = 0;
+        const measureEst = (): number => {
+            const turn = deps.core.processTurn({
+                messages, state: deps.session.state, config: noEmergencyTruncate(ccrLoopConfig(deps.session, activeConfig)),
+                tokenCount: currentTokens, renderTags: "text-only", contentStore: contentStoreOf(deps.session),
+            });
+            deps.session.state = turn.state;
+            adoptContentStore(deps.session, turn.contentStore);
+            const view = applyAbsorbView(turn.messages, turn.state, activeConfig, currentTokens);
+            const est = applyEstimateCalibration(estimateCoreMessages(view) + wireOverhead, kFactor, kOrigin, deps.upstreamOrigin) + imageReserve;
+            result.payloadEstimate = est;
+            // #2952 review: keep the char-count UPPER bound fresh through recovery.
+            // Since #3146 the fit gate reads result.payloadEstimate (set above) for
+            // every regime, so finalUpper no longer drives fitsWindow — but it still
+            // feeds processTurn's tokenCount and the over-window continue/failure
+            // signals below, so a recovery that only lowers the point estimate would
+            // leave those meters stale. Recompute here, same caliber as the main loop.
+            if (!baselineKnown) {
+                finalUpper = estimateCoreMessagesUpper(view) + imageReserve + wireOverhead;
+                currentTokens = Math.max(currentTokens, finalUpper);
+            }
+            return est;
+        };
+        // Wire-position helpers. The distillation span is [first..last] by MESSAGE
+        // index, and the kernel folds EVERYTHING in that span — including any unfolded
+        // raw messages and any other active blocks between the selected ones (#2952
+        // review: a b-ref range is a span, not a set of blocks). The summary input must
+        // therefore cover the whole span or those messages are silently dropped. Enumerate
+        // the span as ordered atoms: each active block contributes its summary once, each
+        // uncovered message its own text.
+        const msgIndex = new Map<string, number>();
+        for (let i = 0; i < messages.length; i++) msgIndex.set(messages[i]!.id, i);
+        const spanExtent = (ids: readonly string[]): [number, number] => {
+            let lo = Number.POSITIVE_INFINITY, hi = -1;
+            for (const id of ids) { const ix = msgIndex.get(id); if (ix === undefined) continue; if (ix < lo) lo = ix; if (ix > hi) hi = ix; }
+            return lo <= hi ? [lo, hi] : [-1, -1];
+        };
+        const spanContent = (lo: number, hi: number): string => {
+            const cover = new Map<string, string>();
+            for (const b of deps.session.state.blocks) if (b.active) for (const id of b.effectiveMessageIds) cover.set(id, b.blockId);
+            const parts: string[] = [];
+            let i = lo;
+            while (i <= hi) {
+                const m = messages[i];
+                const cid = m ? cover.get(m.id) : undefined;
+                if (cid) {
+                    const blk = deps.session.state.blocks.find((x) => x.blockId === cid);
+                    if (blk) parts.push(`[summarized ${blk.topic ? `${blk.blockId}: ${blk.topic}` : blk.blockId}]\n${blk.summary}`);
+                    while (i <= hi) { const mm = messages[i]; if (mm && cover.get(mm.id) === cid) i++; else break; }
+                } else {
+                    if (m) parts.push(`[${m.role}] ${m.text ?? ""}`);
+                    i++;
+                }
+            }
+            return parts.join("\n\n");
+        };
+        let stopReason: "fit" | "exhausted" | "cap" | "unavailable" | "no-shrink" = "fit";
+        let est = measureEst();
+        while (callsUsed < MAX_TIER_DISTILL_CALLS && summaryCalls < summaryBudget && est >= limit && !deps.signal?.aborted) {
+            const active = deps.session.state.blocks.filter((b) => b.active);
+            const t1 = active.filter((b) => b.tier === 1);
+            const srcPool = t1.length >= 2 ? t1 : active.filter((b) => b.tier === 2);
+            if (srcPool.length < 2) { stopReason = "exhausted"; break; }
+            const sourceTier = srcPool[0]!.tier;
+            const positioned = srcPool
+                .map((b) => ({ b, ext: spanExtent(b.effectiveMessageIds) }))
+                .filter((p) => p.ext[0] >= 0)
+                .sort((x, y) => x.ext[0] - y.ext[0]);
+            if (positioned.length < 2) { stopReason = "exhausted"; break; }
+            // Front-most wire-ordered run whose full span stays under the source budget,
+            // measured on its REAL content (blocks + any inter-block messages) and checked
+            // BEFORE committing the next block so the last addition cannot overshoot (#2952 review).
+            let lo = positioned[0]!.ext[0], hi = positioned[0]!.ext[1];
+            let taken = 1;
+            for (let k = 1; k < positioned.length; k++) {
+                const ext = positioned[k]!.ext;
+                const nLo = Math.min(lo, ext[0]), nHi = Math.max(hi, ext[1]);
+                if (spanContent(nLo, nHi).length > TIER_DISTILL_SOURCE_CHAR_BUDGET) break;
+                lo = nLo; hi = nHi; taken++;
+            }
+            if (taken < 2) { stopReason = "exhausted"; break; }
+            const first = positioned[0]!.b;
+            const last = positioned[taken - 1]!.b;
+            const rules = sourceTier === 1 ? deps.prompts.tier2DistillRules : deps.prompts.tier3CondenseRules;
+            const system = buildCompressSystemPrompt(deps.prompts, deps.surface?.promptSections)
+                + `\n\n${rules}\n\nTASK: The tier-${sourceTier} block summaries below must be distilled into ONE tier-${sourceTier + 1} summary because the session context exceeds the model window and raw-message folding alone cannot close the gap. Follow every rule above. Output ONLY the distilled summary text — no preamble, no closing remarks, no tool calls.`;
+            const content = spanContent(lo, hi);
+            let outcome;
+            try {
+                outcome = await summarizeRange(deps, content, first.blockId, last.blockId, undefined, system);
+            } catch (error) {
+                // #2952 review: a thrown summary error (network/relay) must stop
+                // recovery like the normal path does, not escape to the caller.
+                deps.log("warn", `[preflight] tier-${sourceTier}->${sourceTier + 1} distillation summary call failed (${safePrefix(error instanceof Error ? error.message : String(error), 200)}); stopping recovery (#2952)`);
+                stopReason = "unavailable";
+                break;
+            }
+            if ("unusable" in outcome) {
+                deps.log("warn", `[preflight] tier-${sourceTier}->${sourceTier + 1} distillation produced no usable summary (${outcome.unusable}); stopping recovery (#2952)`);
+                stopReason = "unavailable";
+                break;
+            }
+            const ctx: RewriteCtx = { core: deps.core, config: activeConfig, messages, session: deps.session, log: (m) => deps.log("info", m) };
+            const fold = parseCompressInput({ content: [{ startId: first.blockId, endId: last.blockId, summary: outcome.summary, topic: `preflight tier-${sourceTier + 1} distill (#2952)` }] });
+            const applied = applyRanges(fold, ctx, { loopTracking: false });
+            if (applied.outcome === "refused") {
+                deps.log("warn", `[preflight] tier distillation apply refused: ${safePrefix(applied.text, 200)}; stopping recovery (#2952)`);
+                stopReason = "unavailable";
+                break;
+            }
+            deps.session.stats.lastInputTokens += defaultCountTokens(outcome.summary);
+            const after = measureEst();
+            const gained = est - after;
+            callsUsed += 1;
+            summaryCalls += 1;
+            // #2952 review: count the distillation as a real fold so the caller
+            // rebuilds THIS round's outbound request from the recovered state
+            // (server.ts only rebuilds when compressedRanges > 0).
+            result.compressedRanges += 1;
+            result.savedTokens += Math.max(0, gained);
+            if (gained <= 0) {
+                deps.log("warn", `[preflight] tier-${sourceTier}->${sourceTier + 1} distillation netted ${gained} tokens (no shrink); stopping recovery (#2952)`);
+                stopReason = "no-shrink";
+                break;
+            }
+            netSaved += gained;
+            est = after;
+            if (est < limit) { stopReason = "fit"; break; }
+            deps.log("info", `[preflight] tier-${sourceTier}->${sourceTier + 1} distillation merged b-range ${first.blockId}..${last.blockId} into one block; net -${gained} tok, payload ~${after} vs window ${limit} (${callsUsed}/${MAX_TIER_DISTILL_CALLS} calls, #2952)`);
+        }
+        if (stopReason === "fit" && est >= limit) stopReason = "cap";
+        const recovered = est < limit;
+        if (recovered) currentTokens = Math.min(currentTokens, est);
+        const overBy = Math.max(0, est - limit);
+        // #2952 review: name WHY recovery ended — claim "every tier is exhausted"
+        // only when there was genuinely nothing left to distill; a call-cap hit or an
+        // unavailable summary is not tier exhaustion.
+        const why = stopReason === "exhausted" ? "every compression tier is exhausted"
+            : stopReason === "cap" ? `the bounded distillation call budget was reached after ${callsUsed} call(s)`
+            : stopReason === "unavailable" ? "the distillation summary was unavailable"
+            : "a distillation pass produced no further shrink";
+        const honestDetail =
+            `futile round: folding compressible raw messages plus tier distillation (${callsUsed} summary call(s), net ~${netSaved} tokens saved) still leaves the payload ~${overBy} tokens over the window — ${why}. ` +
+            `These figures are measured on the post-fold wire view; the separately displayed context total additionally floors on the upstream usage baseline, which also bills the system prompt and tool definitions. ` +
+            `Raise the model context window or restart the session.`;
+        return { recovered, callsUsed, netSaved, honestDetail };
+    };
     for (let round = 0; round < effectiveRoundCap; round++) {
         if (deps.signal?.aborted) {
             failure = ABORTED_FAILURE;
@@ -1610,9 +1786,17 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             // #558-merge: the upper-bound regime also carries the image/wire
             // floors — they are real billed costs the fold can never remove
             // (#470/#488 postdate this PR's fork point).
+            // #3146: the char-count bound pins currentTokens so the kernel keeps
+            // marking ranges compressible WHILE folding, but it NO LONGER boosts
+            // decisionTokens — the per-round exit and the final fit judge on the
+            // calibrated CJK-aware estimate (payloadEstimate), not raw char count.
+            // Chars-as-tokens made a fitting payload unsatisfiable (#3146): the
+            // bound stayed over-window no matter how much folded, so a successful
+            // fold still failed fast after burning every round. Char count remains
+            // the TRIGGER arm only (server.ts decisionTrigger), where erring early
+            // is harmless.
             finalUpper = estimateCoreMessagesUpper(turn.messages) + imageReserve + wireOverhead;
             currentTokens = Math.max(currentTokens, finalUpper);
-            decisionTokens = Math.max(decisionTokens, estimateCoreMessagesUpper(turn.messages) + wireOverhead);
         }
         // The caller's forward/fail-fast gate uses the payload's own estimate
         // (the floor can be stale — see PreflightResult.payloadEstimate).
@@ -1704,6 +1888,17 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                     potential = relaxedPotential;
                 }
                 const zoneNote = relaxed ? ", including the relaxed recent zone" : "";
+                // #2952 Design A: raw-range folding (even with the recent zone
+                // relaxed) cannot close the gap, but distilling existing
+                // lower-tier BLOCKS might — and the model cannot do it because its
+                // next turn is refused by this very fail-fast (the deadlock in
+                // #2952). Defer the verdict to the post-walk recovery funnel
+                // instead of declaring futility here. Never entered for tiers=false
+                // or emergency digest mode, so both paths stay byte-identical.
+                if (eligibleForTierRecovery()) {
+                    deps.log("info", `[preflight] raw-fold pool (~${potential} tok${zoneNote}) below deficit (~${deficit} tok); deferring to bounded tier-distillation recovery (#2952)`);
+                    break;
+                }
                 failure = { kind: "exhausted", detail: `futile round: the maximum possible saving from all foldable content (~${potential} tokens${zoneNote}) is below the required reduction (~${deficit} tokens) — no combination of folds can bring the payload under the target. Raise the model context window or restart the session.` };
                 deps.log("warn", `[preflight] skipping futile round: max possible saving ~${potential} tok < required ~${deficit} tok${zoneNote}; zero summarization calls spent (#1841)`);
                 break;
@@ -1716,7 +1911,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             // estimate (not currentTokens, which is floored by a possibly-stale
             // lastInputTokens from a prior model): if the real payload already
             // fits, stop instead of folding protected content.
-            if (!relaxed && (baselineKnown ? result.payloadEstimate : finalUpper) >= limit) {
+            if (!relaxed && result.payloadEstimate >= limit) {
                 activeConfig = relaxedConfig(deps.config);
                 relaxed = true;
                 textTarget = Math.max(0, limit - imageReserve);
@@ -2379,10 +2574,18 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                 // #1372 contract: per-range skip notes are the diagnosis of WHY
                 // candidates died — carry them into the bail verdict too.
                 const skipNote = skipReasons.length > 0 ? ` Skipped: ${skipReasons.slice(0, 3).join(" | ")}.` : "";
+                // #2952 Design A: some raw folds landed but the remaining RAW pool
+                // can't close the gap — distilling existing lower-tier blocks might.
+                // Defer to the post-walk recovery funnel instead of failing here
+                // (tiers=false / emergency digest never enter this branch).
+                if (eligibleForTierRecovery()) {
+                    deps.log("info", `[preflight] remaining raw-fold pool (~${bailRemaining} tok${zoneNote}) below deficit (~${bailDeficit} tok); deferring to bounded tier-distillation recovery (#2952)`);
+                    break;
+                }
                 failure = { kind: "exhausted", detail: `futile round: after the folds so far, the remaining foldable content (~${bailRemaining} tokens${zoneNote}) cannot close the ~${bailDeficit}-token gap to the target even if every remaining range folded successfully.${skipNote} Raise the model context window or restart the session.` };
                 break;
             }
-            if (!failure && !budgetHit && !relaxed && (baselineKnown ? result.payloadEstimate : finalUpper) >= limit) {
+            if (!failure && !budgetHit && !relaxed && result.payloadEstimate >= limit) {
                 activeConfig = relaxedConfig(deps.config);
                 relaxed = true;
                 summaryCalls = 0;
@@ -2395,36 +2598,56 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         }
     }
     if (currentTokens >= limit && !failure) {
-        // #726: carry the most recent unusable-summary diagnosis into the
-        // fail-fast message — "no range could be compressed" with no reason is
-        // undiagnosable from the client side.
-        // #1372: carry the actual per-range skip reasons too — the old hardcoded
-        // parenthetical claimed causes that often had not happened (e.g. "below
-        // minCompressRange" for a range that died before any summary call).
-        const unusableNote = lastUnusableDetail ? ` Last unusable summary: ${safePrefix(lastUnusableDetail, 300)}.` : "";
-        const skipNote = skipReasons.length > 0 ? ` Skipped: ${skipReasons.slice(0, 3).join(" | ")}.` : "";
-        if (budgetHit) {
-            failure = { kind: "exhausted", detail: `the preflight summarization budget (${summaryBudget} calls per protection regime) was exhausted before the payload fit the window${unusableNote}${skipNote}` };
-        } else if (relaxed && result.compressedRanges > 0) {
-            failure = { kind: "exhausted", detail: `${relaxedExhaustedDetail}${skipNote}` };
-        } else if (result.compressedRanges === 0) {
-            const cause = poolQueueDrop
-                ? "the shared summary pool was saturated and no summary call was ever dispatched (scheduler congestion, not a chain failure; auto-fold retries next turn)"
-                : skipReasons.length > 0
-                    ? skipReasons.slice(0, 3).join(" | ")
-                    : "each was below minCompressRange, had an unusable summary, or failed to apply";
-            failure = { kind: "exhausted", detail: rangesTried === 0
-                ? `no viable range could be compressed: ${cause}${unusableNote}`
-                : `no range could be compressed across ${rangesTried} viable range${rangesTried === 1 ? "" : "s"}: ${cause}${unusableNote}` };
-        } else {
-            failure = { kind: "exhausted", detail: `the compress budget was exhausted after ${effectiveRoundCap} rounds${unusableNote}${skipNote}` };
+        // #2952 Design A: last-resort bounded tier-distillation recovery before any
+        // exhaustion verdict is final. Reached from a deferred futility gate, a
+        // deferred mid-walk bail, or natural walk exhaustion alike — exactly one
+        // bounded chance per invocation. On success currentTokens drops under the
+        // window and the verdict branches below are skipped entirely; on failure it
+        // installs the honest all-tier-exhaustion detail. Never entered for
+        // tiers=false / emergency digest mode, so those paths keep their exact
+        // prior verdicts.
+        if (!tierRecoveryAttempted && eligibleForTierRecovery()) {
+            tierRecoveryAttempted = true;
+            const rec = await attemptTierRecovery();
+            deps.log("info", `[preflight] tier-distillation recovery finished: ${rec.recovered ? "recovered" : "not recovered"}; ${rec.callsUsed} summary call(s), net ~${rec.netSaved} tok saved (#2952)`);
+            if (!rec.recovered) {
+                failure = { kind: "exhausted", detail: rec.honestDetail };
+            }
+        }
+        if (currentTokens >= limit && !failure) {
+            // #726: carry the most recent unusable-summary diagnosis into the
+            // fail-fast message — "no range could be compressed" with no reason is
+            // undiagnosable from the client side.
+            // #1372: carry the actual per-range skip reasons too — the old hardcoded
+            // parenthetical claimed causes that often had not happened (e.g. "below
+            // minCompressRange" for a range that died before any summary call).
+            const unusableNote = lastUnusableDetail ? ` Last unusable summary: ${safePrefix(lastUnusableDetail, 300)}.` : "";
+            const skipNote = skipReasons.length > 0 ? ` Skipped: ${skipReasons.slice(0, 3).join(" | ")}.` : "";
+            if (budgetHit) {
+                failure = { kind: "exhausted", detail: `the preflight summarization budget (${summaryBudget} calls per protection regime) was exhausted before the payload fit the window${unusableNote}${skipNote}` };
+            } else if (relaxed && result.compressedRanges > 0) {
+                failure = { kind: "exhausted", detail: `${relaxedExhaustedDetail}${skipNote}` };
+            } else if (result.compressedRanges === 0) {
+                const cause = poolQueueDrop
+                    ? "the shared summary pool was saturated and no summary call was ever dispatched (scheduler congestion, not a chain failure; auto-fold retries next turn)"
+                    : skipReasons.length > 0
+                        ? skipReasons.slice(0, 3).join(" | ")
+                        : "each was below minCompressRange, had an unusable summary, or failed to apply";
+                failure = { kind: "exhausted", detail: rangesTried === 0
+                    ? `no viable range could be compressed: ${cause}${unusableNote}`
+                    : `no range could be compressed across ${rangesTried} viable range${rangesTried === 1 ? "" : "s"}: ${cause}${unusableNote}` };
+            } else {
+                failure = { kind: "exhausted", detail: `the compress budget was exhausted after ${effectiveRoundCap} rounds${unusableNote}${skipNote}` };
+            }
         }
     }
     result.rangesRemaining = rangesRemaining;
     result.savedTokens = Math.max(0, startTokens - currentTokens);
     if (deps.signal?.aborted) failure = ABORTED_FAILURE;
     if (currentTokens >= limit || failure?.kind === "aborted") result.failure = failure;
-    result.fitsWindow = baselineKnown ? result.payloadEstimate < limit : finalUpper < limit;
+    // #3146: both regimes judge fit on the calibrated CJK-aware estimate — the
+    // char-count upper bound was the trigger arm, never the reject-forward gate.
+    result.fitsWindow = result.payloadEstimate < limit;
     if (deps.externalSummary !== undefined) {
         result.externalDispatch = { calls: deps.externalSummary.stats.calls, attempts: deps.externalSummary.stats.attempts };
     }

@@ -187,12 +187,13 @@ test("#2324 mixed suspected+confirmed -> strong warning retained while naming bo
     assert.ok(r.what.length > 0, "families named");
 });
 
-test("#2324 native-compaction-only -> confirmed conflict framing", () => {
+test("#2324/#2912 native-compaction-only (recovered) ledger stands down silently — no alarm", () => {
     const sev = bannerSeverity();
     const r = sev({ events: 7, kinds: { "native-compaction": 7 }, active: 7 });
-    assert.strictEqual(r.hasConfirmed, true);
-    assert.strictEqual(r.onKey, "conflict.on");
-    assert.strictEqual(r.riskKey, "conflict.risk_active");
+    // #2912: a marker-detected landing is by construction already rebased onto (#2372/#2432),
+    // so a pure-recovered ledger is handled stock, not confirmed evidence — the banner hides.
+    assert.strictEqual(r.hasConfirmed, false);
+    assert.strictEqual(r.neutralOnly, true, "fully-handled ledger stands down (banner hidden)");
 });
 
 test("#2324 old payload without c.suspected degrades to the previous all-confirmed view", () => {
@@ -237,22 +238,26 @@ test("#2545 a lone unannounced-rewrite was escalated to a confirmed warning befo
     assert.strictEqual(r.riskKey, "conflict.risk_unconfirmed");
 });
 
-test("#2545 stale confirmed stock + fresh unconfirmed signal -> confirmed framing graded by its own age", () => {
+test("#2545/#2912 recovered native-compaction + rewrite: no longer confirmed stock — the rewrite drives the unconfirmed tier", () => {
     const sev = bannerSeverity();
+    // #2912: the marker-detected landing is handled stock (rebased onto), so it no longer
+    // lights the confirmed tier; only the observed rewrite remains, at the unconfirmed level.
     const stale = sev({
         events: 2, sessions: 2,
         kinds: { "native-compaction": 1, "unannounced-rewrite": 1 },
         active: 2, historical: 0, activeConfirmed: 0,
     });
-    assert.strictEqual(stale.hasConfirmed, true, "native-compaction IS confirmed evidence");
-    assert.strictEqual(stale.riskKey, "conflict.risk_historical", "liveness follows the confirmed evidence, not the fresh signal");
+    assert.strictEqual(stale.hasConfirmed, false, "recovered native-compaction is no longer confirmed evidence");
+    assert.strictEqual(stale.onKey, "conflict.on_unconfirmed");
+    assert.strictEqual(stale.riskKey, "conflict.risk_unconfirmed");
 
     const fresh = sev({
         events: 2, sessions: 2,
         kinds: { "native-compaction": 1, "unannounced-rewrite": 1 },
         active: 2, historical: 0, activeConfirmed: 1,
     });
-    assert.strictEqual(fresh.riskKey, "conflict.risk_active");
+    assert.strictEqual(fresh.hasConfirmed, false);
+    assert.strictEqual(fresh.riskKey, "conflict.risk_unconfirmed");
 });
 
 test("#2545 old payload without displayOnly degrades: stock suspected records keep the soft tier", () => {

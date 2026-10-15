@@ -102,8 +102,13 @@ export const WEB_CLIENT = `(function () {
         const displayOnlyN = Math.max(0, Math.min(typeof c.displayOnly === "number" ? c.displayOnly : 0, pluginN - siblingN));
         const suspectedN = Math.max(0, Math.min(typeof c.suspected === "number" ? c.suspected : 0, pluginN - siblingN - displayOnlyN));
         const confirmedTpN = Math.max(0, pluginN - siblingN - displayOnlyN - suspectedN);
-        const confirmedNativeN = (kinds["native-compaction"] || 0) + (kinds["native-compaction-inferred"] || 0); // #2709: inferred landings share the confirmed-native remediation tier
-        const signalN = Math.max(0, c.events - pluginN - confirmedNativeN);
+        // #2709/#2912: only an attribution-only (inferred) landing is CONFIRMED evidence — a
+        // marker-detected landing (native-compaction) was already rebased onto (#2372/#2432),
+        // so it is handled stock, not an alarm. Kept out of signalN too, else it masquerades
+        // as an unexplained rewrite (warned-on-impact policy, #2912).
+        const confirmedNativeN = kinds["native-compaction-inferred"] || 0;
+        const handledNativeN = kinds["native-compaction"] || 0;
+        const signalN = Math.max(0, c.events - pluginN - confirmedNativeN - handledNativeN);
         const whatParts = [];
         if (confirmedTpN > 0) whatParts.push(t("conflict.what_plugin"));
         if (suspectedN > 0) whatParts.push(t("conflict.what_suspected"));
@@ -137,7 +142,7 @@ export const WEB_CLIENT = `(function () {
         // #2430/#2545: a ledger naming ONLY bili's own siblings or verified read-only viewers
         // stands down completely — compatible family / non-compressors, not conflicts.
         const siblingOnly = !hasConfirmed && suspectedN === 0 && signalN === 0 && siblingN > 0;
-        const neutralOnly = !hasConfirmed && suspectedN === 0 && signalN === 0 && (siblingN + displayOnlyN) > 0;
+        const neutralOnly = !hasConfirmed && suspectedN === 0 && signalN === 0 && (siblingN + displayOnlyN + handledNativeN) > 0; // #2912: fully-handled (recovered-native-only) ledger also stands down
         // #2969: per-client remediation hints are imperative ("disable auto-compaction,
         // start a fresh session") — they belong to CONFIRMED and UNCONFIRMED-SIGNAL tiers.
         // A suspected-only ledger already carries verify-first wording in riskText; an
@@ -536,6 +541,24 @@ export const WEB_CLIENT = `(function () {
             stale.hidden = true;
             stale.classList.remove("show");
             stale.innerHTML = "";
+        }
+        const sb = $("storage-degraded-banner");
+        if (sb) {
+            const sg = d.storage;
+            if (sg && sg.degraded) {
+                sb.hidden = false;
+                sb.classList.add("show");
+                sb.innerHTML = "<strong>" + t("sys.storage_degraded_title") + "</strong> " + escapeHtml(t("sys.storage_degraded", { reason: sg.reason || "" }))
+                    + '<div style="margin-top:8px;display:flex;gap:8px">'
+                    + '<button id="report-copy-btn" class="btn sm">' + t("sys.report_copy") + "</button>"
+                    + '<a id="report-issue-link" class="btn sm" target="_blank" rel="noopener noreferrer" href="#">' + t("sys.report_issue") + "</a>"
+                    + "</div>";
+                attachReportButtons("storage-legacy-only", sb);
+            } else {
+                sb.hidden = true;
+                sb.classList.remove("show");
+                sb.innerHTML = "";
+            }
         }
         const pt = $("passthrough-banner");
         if (d.passthrough && d.passthrough.enabled) {
@@ -1153,6 +1176,7 @@ export const WEB_CLIENT = `(function () {
         const parts = [];
         parts.push('<a class="btn sm" href="#/sessions">' + t("common.back") + "</a>");
         parts.push('<div class="page-head"><div><h1 title="' + escapeHtml(d.title || d.label || d.id) + '">' + escapeHtml(d.title || d.label || d.id.slice(0, 16)) + '</h1><div class="sub mono">' + escapeHtml(d.id) + "</div></div><div>" + detailBadges(d) + "</div></div>");
+        parts.push('<div style="display:flex;align-items:center;gap:8px;margin-top:12px;flex-wrap:wrap"><span class="dim small">' + t("det.report_note") + '</span><button id="sessrpt-md" class="btn sm">' + t("det.report_md") + '</button><button id="sessrpt-png" class="btn sm">' + t("det.report_png") + '</button></div>');
         parts.push('<div class="card"><div class="card-h"><span>' + t("det.identity") + '</span></div><div class="card-b"><dl class="kv">');
         // Full title wraps in place, is hoverable (title attr) and carries a copy button.
         parts.push('<div class="k">' + t("common.title") + '</div><div class="v" title="' + escapeHtml(d.title || "") + '">' + (d.title ? escapeHtml(d.title) + ' <button id="title-copy" class="btn sm">' + t("common.copy") + "</button>" : '<span class="faint">' + t("common.none") + "</span>") + "</div>");
@@ -1491,6 +1515,7 @@ export const WEB_CLIENT = `(function () {
             bindHandoffActions(d);
             bindBlocksActions(d);
             bindCacheReportActions(d);
+            bindSessionReportActions(d);
             const cc = $("session-conflicts-clear");
             if (cc) {
                 cc.addEventListener("click", async () => {
@@ -1545,6 +1570,37 @@ export const WEB_CLIENT = `(function () {
         if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text).then(done).catch(fallback);
         else fallback();
     }
+    // #3040: generic report wiring shared by every warning banner — fetches the
+    // topic's diagnostics report and binds #report-copy-btn (clipboard) +
+    // #report-issue-link (prefilled GitHub issue) inside the given container.
+    // The overview poll re-renders banners every 5s while degraded, so the
+    // fetch is cached per topic (60s): without it each refresh re-hit
+    // /__bili/diagnostics — a full server-side blob rebuild (listSessions +
+    // whole-file log reads) — and re-toasted on every failed poll (the
+    // #1937 poll backoff does not cover this fetch).
+    const DIAG_CACHE_MS = 60_000;
+    const diagCache = {};
+    const diagToastedOnce = {};
+    function bindReport(d, copyBtn, issueLink) {
+        if (copyBtn) copyBtn.addEventListener("click", () => copyText(d.blob, copyBtn));
+        if (issueLink && typeof d.url === "string") issueLink.href = d.url;
+    }
+    async function attachReportButtons(topic, host) {
+        const copyBtn = host.querySelector("#report-copy-btn");
+        const issueLink = host.querySelector("#report-issue-link");
+        const hit = diagCache[topic];
+        if (hit && Date.now() - hit.at < DIAG_CACHE_MS) return bindReport(hit.d, copyBtn, issueLink);
+        busy(copyBtn, true);
+        try {
+            const d = await json("/__bili/diagnostics?topic=" + encodeURIComponent(topic));
+            diagCache[topic] = { at: Date.now(), d };
+            bindReport(d, copyBtn, issueLink);
+        } catch (e) {
+            if (!diagToastedOnce[topic]) { diagToastedOnce[topic] = true; toast(friendlyMsg(e), "err"); }
+        } finally {
+            busy(copyBtn, false);
+        }
+    }
     function refRangeOf(b) {
         return b.startRef ? (b.endRef && b.endRef !== b.startRef ? b.startRef + "–" + b.endRef : b.startRef) : null;
     }
@@ -1567,6 +1623,59 @@ export const WEB_CLIENT = `(function () {
         L.push("- blocks: " + d.blockDetails.length + " (" + d.blockDetails.filter((x) => x.active).length + " active)");
         d.blockDetails.forEach((b) => { L.push(""); L.push(buildBlockMd(b)); });
         return L.join("\\n");
+    }
+    // #3057 report export: MD/SVG render server-side (/__bili/session-report); the browser downloads MD and rasterizes the closed-vector SVG to PNG.
+    function downloadUrl(url, name) {
+        var a = document.createElement("a");
+        a.href = url; a.download = name;
+        document.body.appendChild(a); a.click(); a.remove();
+        setTimeout(function () { URL.revokeObjectURL(url); }, 4000);
+    }
+    function svgToPngBlob(svgStr, w, h) {
+        return new Promise(function (resolve, reject) {
+            var scale = Math.max(1, Math.min(2, 1600 / w));
+            var outW = Math.round(w * scale), outH = Math.round(h * scale);
+            if (outH > 14000) { scale = 14000 / h; outW = Math.round(w * scale); outH = Math.round(h * scale); }
+            var img = new Image();
+            var url = URL.createObjectURL(new Blob([svgStr], { type: "image/svg+xml;charset=utf-8" }));
+            img.onload = function () {
+                try {
+                    var canvas = document.createElement("canvas");
+                    canvas.width = outW; canvas.height = outH;
+                    var ctx = canvas.getContext("2d");
+                    ctx.fillStyle = "#ffffff"; ctx.fillRect(0, 0, outW, outH);
+                    ctx.drawImage(img, 0, 0, outW, outH);
+                    URL.revokeObjectURL(url);
+                    canvas.toBlob(function (b) { b ? resolve(b) : reject(new Error("PNG encode failed")); }, "image/png");
+                } catch (e) { URL.revokeObjectURL(url); reject(e); }
+            };
+            img.onerror = function () { URL.revokeObjectURL(url); reject(new Error("SVG rasterize failed")); };
+            img.src = url;
+        });
+    }
+    function bindSessionReportActions(d) {
+        var mdBtn = $("sessrpt-md"), pngBtn = $("sessrpt-png");
+        if (!mdBtn && !pngBtn) return;
+        var safeId = String(d.id).replace(/[^A-Za-z0-9._-]/g, "_");
+        var base = "billion-context-report-" + safeId;
+        var q = "session=" + encodeURIComponent(d.id) + "&mask=on&lang=" + (locale === "en" ? "en" : "zh-CN");
+        if (mdBtn) mdBtn.addEventListener("click", async function () {
+            busy(mdBtn, true);
+            try {
+                var r = await json("/__bili/session-report?format=md&" + q);
+                if (!r || typeof r.md !== "string") throw new Error("no report");
+                downloadUrl(URL.createObjectURL(new Blob([r.md], { type: "text/markdown;charset=utf-8" })), base + ".md");
+            } catch (e) { toast(t("toast.failed", { msg: e.message }), "err"); } finally { busy(mdBtn, false); }
+        });
+        if (pngBtn) pngBtn.addEventListener("click", async function () {
+            busy(pngBtn, true);
+            try {
+                var r = await json("/__bili/session-report?format=svg&" + q);
+                if (!r || !r.svg) throw new Error("no report");
+                var blob = await svgToPngBlob(r.svg, r.w || 920, r.h || 800);
+                downloadUrl(URL.createObjectURL(blob), base + ".png");
+            } catch (e) { toast(t("toast.failed", { msg: e.message }), "err"); } finally { busy(pngBtn, false); }
+        });
     }
     function bindBlocksActions(d) {
         if (!d.blockDetails || !d.blockDetails.length) return;
@@ -1835,7 +1944,7 @@ export const WEB_CLIENT = `(function () {
         try { draft = JSON.parse(fe && fe.value ? fe.value : "{}"); if (!draft || typeof draft !== "object" || Array.isArray(draft)) draft = {}; } catch (e) { return; }
         function compressOf(d) { return (d.compress && typeof d.compress === "object" && !Array.isArray(d.compress)) ? d.compress : null; }
         const NUDGE_DEFAULT = 50000, NUDGE_STEP = 5000, NUDGE_LOW = 20000, NUDGE_HIGH = 100000;
-        const PRM_KERNEL_DEFAULT = 5;
+        const PRM_KERNEL_DEFAULT = 3;
         const brokenNote = document.createElement("div");
         brokenNote.style.cssText = "min-height:16px;font-size:12px;color:#cf222e";
         box.appendChild(brokenNote);
@@ -1855,8 +1964,6 @@ export const WEB_CLIENT = `(function () {
             const cp = compressOf(draft);
             dbg.inp.checked = draft.debug === true;
             ptRow.inp.checked = draft.passthrough === true;
-            dsgRow.inp.checked = Boolean(draft.dsh && draft.dsh.allowDshCompaction === true);
-            dsgWarnNote.hidden = !(draft.dsh && draft.dsh.allowDshCompaction === true);
             const pv = (cp && typeof cp.promptPack === "string") ? cp.promptPack : "default";
             while (packSel.options.length > 0) packSel.removeChild(packSel.lastChild);
             ["default", "lean"].forEach((name) => {
@@ -1936,26 +2043,6 @@ export const WEB_CLIENT = `(function () {
         qCtrls.push(ptRow.inp);
         ptRow.inp.addEventListener("change", () => commit((d) => { if (ptRow.inp.checked) d.passthrough = true; else delete d.passthrough; }));
         void ptRow.ctl;
-        // #2028: env BILI_ALLOW_DSH_COMPACTION outranks the file — keep the control out
-        // of qCtrls in that case so quickBroken's blanket enable/disable never re-enables it.
-        const dsgEnvForced = Boolean(cfg.allowDshCompaction && cfg.allowDshCompaction.source === "env");
-        const dsgRow = row("quick-dsg", t("cfg.q_dsh_compact"));
-        if (!dsgEnvForced) qCtrls.push(dsgRow.inp);
-        const dsgWarnNote = document.createElement("div");
-        dsgWarnNote.style.cssText = "margin:-6px 0 4px;font-size:12px;color:#9a6700";
-        dsgWarnNote.textContent = t("cfg.q_dsh_compact_warn");
-        dsgWarnNote.hidden = true;
-        box.appendChild(dsgWarnNote);
-        const dsgEnvNote = document.createElement("div");
-        dsgEnvNote.style.cssText = "margin:-6px 0 4px;font-size:12px;color:#57606a";
-        dsgEnvNote.textContent = t("cfg.q_dsh_compact_env");
-        dsgEnvNote.hidden = true;
-        box.appendChild(dsgEnvNote);
-        dsgRow.inp.addEventListener("change", () => commit((d) => {
-            if (dsgRow.inp.checked) { if (!d.dsh || typeof d.dsh !== "object") d.dsh = {}; d.dsh.allowDshCompaction = true; }
-            else { if (d.dsh) { delete d.dsh.allowDshCompaction; if (Object.keys(d.dsh).length === 0) delete d.dsh; } }
-        }));
-        if (dsgEnvForced) { dsgRow.inp.disabled = true; dsgEnvNote.hidden = false; }
         const packSel = document.createElement("select");
         packSel.className = "field-input mono";
         qCtrls.push(packSel);

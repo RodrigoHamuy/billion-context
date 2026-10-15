@@ -52,7 +52,7 @@ import {
     retrieveToolsFor,
     IMAGE_FULL_TOOL_GOOGLE,
 } from "../src/compress-tool.ts";
-import { WIRE_RULES, WIRE_HEADER_RULES, VALIDATORS, startFakeUpstream, validateResponsesWsCreate, validateGoSessionHeaders, type Wire } from "./wire-contract-fakes.ts";
+import { WIRE_RULES, WIRE_HEADER_RULES, VALIDATORS, startFakeUpstream, validateResponsesWsCreate, validateCodexResponsesWsCreate, validateGoSessionHeaders, type Wire } from "./wire-contract-fakes.ts";
 
 type ToolShape = Record<string, unknown>;
 
@@ -101,6 +101,22 @@ test("WC-016 validates global-scope breakpoint ordering (render order: tools →
         system: [{ type: "text", text: "s", cache_control: { type: "ephemeral" } }],
         tools: [{ name: "t", input_schema: { type: "object", properties: {} } }],
         messages: [{ role: "user", content: [{ type: "text", text: "u", cache_control: { type: "ephemeral" } }] }],
+    }), []);
+});
+
+test("WC-018 validates user-side part order on the Google wire (plain text before functionResponse)", () => {
+    // #3159 shape: plain text AFTER a functionResponse part → Vertex 400.
+    assert.match(VALIDATORS.google({
+        contents: [{ role: "user", parts: [{ functionResponse: { name: "add", response: { result: 66 } } }, { text: "nudge" }] }],
+    })[0], /WC-018/);
+    // Legal: text leads, functionResponse trails (the A/B-accepted order).
+    assert.deepEqual(VALIDATORS.google({
+        contents: [{ role: "user", parts: [{ text: "nudge" }, { functionResponse: { name: "add", response: { result: 66 } } }] }],
+    }), []);
+    // Signed plain text is excluded from the movable set (signature-bound) — the
+    // validator mirrors the kernel's normalizeGoogleUserPartOrder predicate.
+    assert.deepEqual(VALIDATORS.google({
+        contents: [{ role: "user", parts: [{ functionResponse: { name: "add", response: {} } }, { text: "signed", thoughtSignature: "sig" }] }],
     }), []);
 });
 
@@ -171,14 +187,29 @@ test("wire-contract ledger: every rule has a live enforcement clause", () => {
         google: [
             { tools: [{ functionDeclarations: [{ name: "bad-name", parameters: { type: "object", properties: {} } }] }] },
             { tools: [{ functionDeclarations: [{ name: "ok", parameters: { anyOf: [] } }] }] },
+            // WC-018: the #3159 shape — plain text after a functionResponse part.
+            { contents: [{ role: "user", parts: [{ functionResponse: { name: "add", response: {} } }, { text: "nudge" }] }] },
         ],
     };
     for (const rule of WIRE_RULES) {
+        if (rule.lane) continue; // lane-scoped rules are gated by their own lane's fake — see the lane probe gate below
         const enforced = probes[rule.wire].some((body) =>
             VALIDATORS[rule.wire](body).some((v) => v.startsWith(rule.id)),
         );
         assert.ok(enforced, `rule ${rule.id} (${rule.summary}) has no live enforcement clause in the fakes`);
     }
+});
+
+test("wire-contract ledger: every lane-scoped rule has a live enforcement clause", () => {
+    // Lane-scoped constraints hold on ONE client's lane only — the shared wire validator
+    // cannot enforce them (WC-013 forbids exactly what WC-017 requires, same frame shape).
+    const laneProbes: Array<{ ruleId: string; validate: (body: unknown) => string[]; body: unknown }> = [
+        { ruleId: "WC-017", validate: validateCodexResponsesWsCreate, body: { type: "response.create", input: [] } },
+    ];
+    for (const { ruleId, validate, body } of laneProbes) {
+        assert.ok(validate(body).some(v => v.startsWith(ruleId)), `lane-scoped rule ${ruleId} has no live enforcement clause in its lane fake`);
+    }
+    for (const rule of WIRE_RULES) if (rule.lane) assert.ok(laneProbes.some(p => p.ruleId === rule.id), `lane-scoped rule ${rule.id} is missing from the lane probe table`);
 });
 
 test("wire-contract ledger: every header rule has a live enforcement clause", () => {

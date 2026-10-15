@@ -154,6 +154,14 @@ entries:
     group: envonly
     desc_en: "Spawn channel: exact-port requirement (squatters refused loudly instead of hopping)."
     desc_zh: "派生通道：精确端口要求（被占用时响亮拒绝而非跳端口）。"
+  - key: BILI_UPGRADE_REPLACEMENT
+    type: boolean-ish
+    default: "unset"
+    kind: env-only
+    audience: internal
+    group: envonly
+    desc_en: "Spawn channel: marks a self-restart replacement — it must own exactly the freed port or exit without hopping (#3044)."
+    desc_zh: "派生通道：标记自重启替换进程——必须独占被释放的精确端口，否则直接退出而非跳端口（#3044）。"
   - key: BILI_OPENCODE_ACP_SPEC
     type: string
     default: "unset"

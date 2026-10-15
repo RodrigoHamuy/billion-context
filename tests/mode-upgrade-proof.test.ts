@@ -272,8 +272,10 @@ test("mode-upgrade proof (chat wire): proxy->plugin flip keeps one session, one 
         console.log(`proof[mode-upgrade] VERDICT bodies=${bodies.length} proxyFold=#${foldIdx} flip=#${flipBodyIdx} pair=#${pairIdx} blocks=${sess5.state.blocks.length} sticky=1 override=1`);
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
         if (prevXdg === undefined) delete process.env.XDG_STATE_HOME;
         else process.env.XDG_STATE_HOME = prevXdg;

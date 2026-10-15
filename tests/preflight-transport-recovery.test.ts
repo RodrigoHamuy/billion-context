@@ -72,6 +72,7 @@ async function withUpstream(handler: (res: http.ServerResponse, attempt: number)
     } finally {
         const closed = once(server, "close");
         server.close();
+        server.closeIdleConnections?.();
         server.closeAllConnections();
         await closed;
     }

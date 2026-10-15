@@ -1,34 +1,11 @@
 name: CI Windows codex overlay (#686)
 
 on:
-  # #2637 plan #2: run when request-pipeline hot files (AGENTS.md §3) move;
-  # nightly (plan #3) keeps full daily coverage on master. cli/launcher +
-  # win-cmd-argv + the mcp-check script are extra: they are this lane's test
-  # subjects (Windows argv passthrough + launcher overlay). Paths on BOTH
-  # triggers so routine master merges don't pay for three Windows jobs either
-  # (shape follows ci-zcode-real.yml).
+  # #3085: runs on every master PR + push by default (reverts #2637's hot-file gate, which let untested changes ship).
   pull_request:
     branches: [master]
-    paths: &windows-codex-paths
-      - "src/server.ts"
-      - "src/server/**"
-      - "src/loop/**"
-      - "src/compress-loop*.ts"
-      - "src/stream*.ts"
-      - "src/persist.ts"
-      - "src/session*.ts"
-      - "src/agent/**"
-      - "src/cli.ts"
-      - "src/launcher.ts"
-      - "tests/win-cmd-argv.test.ts"
-      - "scripts/windows-codex-mcp-check.ps1"
-      - "tests/e2e/**"
-      - "kernel/**"
-      - "package-lock.json"
-      - ".github/workflows/ci-windows-codex.yml"
   push:
     branches: [master]
-    paths: *windows-codex-paths
   schedule:
     - cron: '30 16 * * *'
   workflow_dispatch: {}

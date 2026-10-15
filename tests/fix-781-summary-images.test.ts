@@ -209,6 +209,7 @@ async function startProxy(upstreamPort: number, model: string, path: string): Pr
 async function closeAll(...servers: http.Server[]): Promise<void> {
     for (const s of servers) {
         s.close();
+        s.closeIdleConnections?.();
         await once(s, "close");
     }
 }

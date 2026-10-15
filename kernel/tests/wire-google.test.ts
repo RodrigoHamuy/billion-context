@@ -6,6 +6,8 @@ import {
   googleSystemText,
   googleToCore,
   injectGoogleSystem,
+  normalizeGoogleUserPartOrder,
+  type GooglePart,
   type GoogleRequestBody,
 } from "../src/wire/google.js";
 import {
@@ -388,4 +390,79 @@ test("google: edited core text re-renders plain while sibling raw parts and sign
     { text: "hello [m00002]", thoughtSignature: "sig-t" },
     { videoMetadata: { startOffset: 0 } },
   ]);
+});
+
+test("normalizeGoogleUserPartOrder: stable partition; signed/thought/non-text parts never move", () => {
+  const fr: GooglePart = {
+    functionResponse: { name: "add", response: { result: 66 }, id: "c1" },
+  };
+  const pure: GooglePart[] = [
+    { text: "hello" },
+    { inlineData: { mimeType: "image/png", data: "x" } },
+  ];
+  assert.equal(normalizeGoogleUserPartOrder(pure), pure);
+  assert.deepEqual(
+    normalizeGoogleUserPartOrder([
+      fr,
+      { text: "nudge" },
+      { inlineData: { mimeType: "image/png", data: "x" } },
+      { text: "more" },
+    ]),
+    [
+      { text: "nudge" },
+      { text: "more" },
+      fr,
+      { inlineData: { mimeType: "image/png", data: "x" } },
+    ],
+  );
+  const signed: GooglePart = { text: "signed", thoughtSignature: "sig" };
+  const thought: GooglePart = { text: "thinking", thought: true };
+  assert.deepEqual(
+    normalizeGoogleUserPartOrder([fr, signed, thought, { text: "plain" }]),
+    [{ text: "plain" }, fr, signed, thought],
+  );
+});
+
+test("coreToGoogle rebuilds a mixed user run with plain text before functionResponse parts (#3159)", () => {
+  const body: GoogleRequestBody = {
+    contents: [
+      { role: "user", parts: [{ text: "go" }] },
+      {
+        role: "model",
+        parts: [{ functionCall: { name: "add", args: { a: 37, b: 29 }, id: "c1" } }],
+      },
+      {
+        role: "user",
+        parts: [
+          { functionResponse: { name: "add", response: { result: 66 }, id: "c1" } },
+          { text: "nudge" },
+        ],
+      },
+    ],
+  };
+  const contents = coreToGoogle(googleToCore(body).msgs);
+  assert.deepEqual(contents[2]!.parts, [
+    { text: "nudge" },
+    { functionResponse: { name: "add", response: { result: 66 }, id: "c1" } },
+  ]);
+});
+
+test("an already-safe user part order round-trips byte-identical through coreToGoogle (#3159)", () => {
+  const body: GoogleRequestBody = {
+    contents: [
+      { role: "user", parts: [{ text: "go" }] },
+      {
+        role: "model",
+        parts: [{ functionCall: { name: "add", args: { a: 37, b: 29 }, id: "c1" } }],
+      },
+      {
+        role: "user",
+        parts: [
+          { text: "nudge" },
+          { functionResponse: { name: "add", response: { result: 66 }, id: "c1" } },
+        ],
+      },
+    ],
+  };
+  assert.deepEqual(coreToGoogle(googleToCore(body).msgs), body.contents);
 });

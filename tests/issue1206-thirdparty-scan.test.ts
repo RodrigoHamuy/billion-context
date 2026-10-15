@@ -561,18 +561,27 @@ test("isDisplayOnlyConflictDetail neutralizes stock records of verified read-onl
     assert.ok(!isDisplayOnlyConflictDetail("event 5"), "non-plugin shapes never classify");
 });
 
-test("summarizeConflicts counts displayOnly and activeConfirmed tiers (#2545)", () => {
+test("summarizeConflicts counts displayOnly and activeConfirmed tiers (#2545/#2912)", () => {
     const a = makeSession();
     recordConflict(a, "third-party-plugin", "pi: npm:pi-context-inspector (C:\\Users\\Administrator\\.pi\\agent\\settings.json) [suspected]");
     recordConflict(a, "third-party-plugin", "pi: npm:context-forge (/home/dog/.pi/agent/settings.json) [suspected]");
     const b = makeSession();
-    recordConflict(b, "native-compaction", "codex: compaction_trigger item");
+    // #2912: only an INFERRED landing is confirmed-tier now — a marker-detected one was already rebased onto.
+    recordConflict(b, "native-compaction-inferred", "codex: compaction framing absent on replay; bili refused 3 client-native call(s) (#2709)");
     const s = summarizeConflicts([a, b]);
     assert.equal(s.events, 3);
     assert.equal(s.suspected, 2);
     assert.equal(s.displayOnly, 1, "the inspector record classifies as display-only (overlaps suspected)");
-    assert.equal(s.activeConfirmed, 1, "only the native-compaction landing is confirmed-tier");
+    assert.equal(s.activeConfirmed, 1, "only the INFERRED native-compaction landing is confirmed-tier");
     assert.equal(s.active, 3);
+});
+
+test("#2912: a pure recovered (marker-detected) native-compaction ledger is NOT confirmed-tier", () => {
+    const r = makeSession();
+    recordConflict(r, "native-compaction", "dsh native compaction: 12/14 covered id(s) replaced; ACP state rebased (#2432)");
+    const s = summarizeConflicts([r]);
+    assert.equal(s.events, 1);
+    assert.equal(s.activeConfirmed, 0, "recovered landing already rebased onto (#2372/#2432) — handled stock, not confirmed evidence");
 });
 
 test("formatConflictSection: display-only-only ledger stands down neutrally (#2545)", () => {
@@ -693,12 +702,16 @@ test("formatConflictSection: pure-[suspected] ledger drops the imperative fix fo
     assert.ok(text2.includes("UNCONFIRMED signal"), "signal framing intact");
 });
 
-test("formatConflictSection: ACP adapter record next to a native landing stays neutral, native tier intact (#2969)", () => {
+test("formatConflictSection: ACP adapter record next to a HANDLED native landing drops to the suspected tier (#2969/#2912)", () => {
     const s = makeSession();
     recordConflict(s, "third-party-plugin", "dsh: @openma/deepseek-harness-acp (/u/dsh/profiles/desktop/package.json) [suspected]");
     recordConflict(s, "native-compaction", "codex: compaction_trigger item");
     const text = formatConflictSection(conflictEventsOf(s)).join("\n");
-    assert.ok(text.includes("Two compressors on one conversation"), "confirmed evidence keeps the header claim");
-    assert.ok(text.includes("client's OWN native compaction landing"), "native tier advice intact");
-    assert.ok(text.includes("\n\nFix"), "confirmed tier keeps the remediation footer");
+    // #2912: the marker-detected native landing is already rebased onto (handled stock), so it
+    // no longer arms the confirmed double-compression header — only the name-only-suspected
+    // plugin remains, governing the verify-first tier (supersedes #2969's pre-#2912 premise).
+    assert.ok(!text.includes("Two compressors on one conversation"), "handled native landing must not re-arm the double-compression header");
+    assert.ok(!text.includes("client's OWN native compaction landing"), "no confirmed-native rebuild advice for a handled landing");
+    assert.ok(text.includes("ALREADY rebased onto"), "the handled-native calm framing is present");
+    assert.ok(text.includes("name-only keyword match"), "the suspected plugin is still flagged for verification");
 });

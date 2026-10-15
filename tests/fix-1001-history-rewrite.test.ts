@@ -235,8 +235,10 @@ test("#1001 e2e openai-wire: silent client history rewrite → boundary marked, 
         assert.equal(new Set(refVals3).size, refVals3.length, "still no duplicate refs after the prune");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });
@@ -358,8 +360,10 @@ test("#1001/#2598 e2e google-wire: silent client history rewrite → boundary ma
         assert.equal(new Set(refVals3).size, refVals3.length, "still no duplicate refs after the prune");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });

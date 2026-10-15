@@ -13,6 +13,18 @@ import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { rmrf } from "./tmp-rm.ts";
 
+// #2941: registration now completes AFTER the bind (post-bind ownership
+// check), so "listening" no longer implies health-readiness — poll for it.
+async function waitReady(port: number): Promise<void> {
+    for (let i = 0; i < 200; i++) {
+        try {
+            if ((await fetch(`http://127.0.0.1:${port}/__bili/health`, { signal: AbortSignal.timeout(500) })).status === 200) return;
+        } catch {}
+        await new Promise((r) => setTimeout(r, 50));
+    }
+    throw new Error(`proxy on port ${port} did not become ready`);
+}
+
 /** #1073: forward-proxy-style (absolute-form) management probes addressed to
  *  bili instances must return real health state instead of being tunneled and
  *  403'd by the target's own admin gate — while every #409 security property
@@ -144,6 +156,8 @@ test("integration: absolute-form management probes answer with real health state
     const port1 = (p1.address() as { port: number }).port;
     const port2 = (p2.address() as { port: number }).port;
     try {
+        await waitReady(port1);
+        await waitReady(port2);
         const health1 = await get(port1, "/__bili/health");
         const health2 = await get(port2, "/__bili/health");
         assert.equal(health1.status, 200);

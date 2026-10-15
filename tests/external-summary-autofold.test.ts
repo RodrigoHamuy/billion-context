@@ -458,7 +458,11 @@ test("degenerate sub-MIN growth window: classic nudges still fire (no silent sup
         upstream: main.url,
         routes: { [main.url]: { models: { "test-model": { context: 8192 } } } },
         modelContextLimit: 8192,
-        kernelConfig: defaultConfig(8192, { preserveRecentMessages: 0, preserveRecentTokens: 0, compress: { minCompressRange: 100, maxSummaryLength: 20000, minSummaryLength: 50 } }),
+        // #3006: the escalation override now honors the kernel's minimum-benefit
+        // floor; this fixture's small pending mass sits below it, so no nudge
+        // would fire anymore. Pin it to legacy any-pending semantics (explicit 0)
+        // so it keeps testing the autoFoldEngaged suppression guard, not the floor.
+        kernelConfig: { ...defaultConfig(8192, { preserveRecentMessages: 0, preserveRecentTokens: 0, compress: { minCompressRange: 100, maxSummaryLength: 20000, minSummaryLength: 50 } }), nudge: { ...defaultConfig(8192).nudge, minPressureBenefitTokens: 0 } },
         compress: {
             injectTool: true,
             injectNudge: true,

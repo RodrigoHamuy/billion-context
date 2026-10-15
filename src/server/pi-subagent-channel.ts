@@ -38,6 +38,8 @@
 // ({type:"namespace", tools:[...]}) exposing ACP grants are seen, not treated as
 // absent.
 
+import { systemCarrierTexts } from "../util.js";
+
 /** Complete child-stamp contract: the producer emits
  *  `<active_agent name="<non-empty>"/>` (XML-attr-escaped name) in the tagged
  *  prompt. We require the prefix plus a quoted non-empty name but do NOT require
@@ -69,54 +71,6 @@ function signalFromText(text: string): PiSubagentChildSignal {
     const m = PI_SUBAGENT_CHILD_MARKER_RE.exec(text);
     if (!m) return { present: false };
     return { present: true, agent: m[1] };
-}
-
-function blockText(v: unknown): string | undefined {
-    if (typeof v === "string") return v;
-    if (typeof v === "object" && v !== null) {
-        const t = (v as Record<string, unknown>).text;
-        if (typeof t === "string") return t;
-    }
-    return undefined;
-}
-
-function pushBlockTexts(out: string[], blocks: unknown[]): void {
-    for (const b of blocks) {
-        const t = blockText(b);
-        if (t !== undefined) out.push(t);
-    }
-}
-
-/** System-carrier texts of a parsed request body, covering all four wire shapes:
- *  anthropic/openai-hoisted top-level `system` (string or text-block array),
- *  responses `instructions`, google `systemInstruction.parts`, and system/developer
- *  entries kept inside `messages[]`/`input[]` by raw clients (identical carrier
- *  list to estimateWireOverhead, src/server/budget.ts). */
-function systemCarrierTexts(parsed: Record<string, unknown>): string[] {
-    const out: string[] = [];
-    const sys = parsed.system;
-    if (typeof sys === "string") out.push(sys);
-    else if (Array.isArray(sys)) pushBlockTexts(out, sys);
-    const inst = parsed.instructions;
-    if (typeof inst === "string") out.push(inst);
-    const si = parsed.systemInstruction;
-    if (typeof si === "object" && si !== null) {
-        const parts = (si as Record<string, unknown>).parts;
-        if (Array.isArray(parts)) pushBlockTexts(out, parts);
-    }
-    for (const key of ["messages", "input"]) {
-        const arr = parsed[key];
-        if (!Array.isArray(arr)) continue;
-        for (const entry of arr) {
-            if (typeof entry !== "object" || entry === null) continue;
-            const rec = entry as Record<string, unknown>;
-            if (rec.role !== "system" && rec.role !== "developer") continue;
-            const c = rec.content;
-            if (typeof c === "string") out.push(c);
-            else if (Array.isArray(c)) pushBlockTexts(out, c);
-        }
-    }
-    return out;
 }
 
 function detectInParsed(parsed: Record<string, unknown>): PiSubagentChildSignal {

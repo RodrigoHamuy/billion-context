@@ -213,15 +213,29 @@ export function piEntryFor(root: string): string {
     return isNpmInstallForm(root) ? PI_NPM_ENTRY : root;
 }
 
+// #3131: pi's packages[] legally mixes string specs ("npm:x", package paths)
+// with object entries ({source: "…"}). Only STRING entries can identify a
+// bili install, so every matcher works on strings alone. The old code ran
+// the whole array through String() and wrote it back — each object became
+// "[object Object]" and users' local packages were silently destroyed.
+export function piPackageStrings(packages: unknown): string[] {
+    return Array.isArray(packages) ? packages.filter((p): p is string => typeof p === "string") : [];
+}
+
+function isBiliPiString(p: unknown, root: string): boolean {
+    return typeof p === "string" && isPiEntry(p, root);
+}
+
 function piInstall(): string {
     const root = selfPackageRoot();
     const file = piSettingsFile();
     const settings = readJson(file);
-    const packages = Array.isArray(settings.packages) ? (settings.packages as unknown[]).map(String) : [];
+    const rawPackages = Array.isArray(settings.packages) ? (settings.packages as unknown[]) : [];
+    const strings = piPackageStrings(settings.packages);
     const entry = piEntryFor(root);
-    if (packages.some((p) => p === entry)) return `pi: already installed (${file})`;
-    const removed = packages.filter((p) => isPiEntry(p, root));
-    const kept = packages.filter((p) => !isPiEntry(p, root));
+    if (strings.includes(entry)) return `pi: already installed (${file})`;
+    const removed = strings.filter((p) => isPiEntry(p, root));
+    const kept = rawPackages.filter((p) => !isBiliPiString(p, root));
     kept.push(entry);
     settings.packages = kept;
     writeJson(file, settings);
@@ -242,10 +256,10 @@ function piRemove(): string {
     const root = selfPackageRoot();
     const file = piSettingsFile();
     const settings = readJson(file);
-    const packages = Array.isArray(settings.packages) ? (settings.packages as unknown[]).map(String) : [];
-    const removed = packages.filter((p) => isPiEntry(p, root));
+    const rawPackages = Array.isArray(settings.packages) ? (settings.packages as unknown[]) : [];
+    const removed = piPackageStrings(settings.packages).filter((p) => isPiEntry(p, root));
     if (removed.length === 0) return `pi: not installed (${file})`;
-    settings.packages = packages.filter((p) => !isPiEntry(p, root));
+    settings.packages = rawPackages.filter((p) => !isBiliPiString(p, root));
     writeJson(file, settings);
     // #788: same visibility rule as install — removed entries are reported.
     return `pi: removed from ${file}\npi: removed entries: ${removed.join(", ")}`;
@@ -253,8 +267,7 @@ function piRemove(): string {
 
 function piStatus(): string {
     const root = selfPackageRoot();
-    const packages = readJson(piSettingsFile()).packages;
-    const list = Array.isArray(packages) ? (packages as unknown[]).map(String) : [];
+    const list = piPackageStrings(readJson(piSettingsFile()).packages);
     // Any entry that loads THIS package's plugin counts (npm: form or abs
     // root); the legacy billion-context-pi package deliberately does not.
     return list.some((p) => isBiliPiEntry(p, root) || p === piEntryFor(root)) ? "installed" : "not installed";
@@ -1519,7 +1532,15 @@ function readKimiInstalledRegistry(file: string): { version: number; plugins: Ki
 function writeJsonAtomic(file: string, data: unknown): void {
     fs.mkdirSync(path.dirname(file), { recursive: true });
     const tmp = `${file}.tmp-${process.pid}`;
-    fs.writeFileSync(tmp, `${JSON.stringify(data, null, 2)}\n`);
+    // fsync before rename: a crash between write and rename otherwise leaves a
+    // size-correct, VDL=0 zero file (#3157).
+    const fd = fs.openSync(tmp, "w");
+    try {
+        fs.writeFileSync(fd, `${JSON.stringify(data, null, 2)}\n`);
+        fs.fsyncSync(fd);
+    } finally {
+        fs.closeSync(fd);
+    }
     fs.renameSync(tmp, file);
 }
 
@@ -1953,8 +1974,7 @@ export function opencodeCacheCopyRoot(env: NodeJS.ProcessEnv = process.env): str
 export function inspectLanePresence(agent: PluginAgent): LanePresence {
     if (agent === "pi") {
         const root = selfPackageRoot();
-        const packages = readJson(piSettingsFile()).packages;
-        const list = Array.isArray(packages) ? (packages as unknown[]).map(String) : [];
+        const list = piPackageStrings(readJson(piSettingsFile()).packages);
         const entries = list.filter((p) => isBiliPiEntry(p, root) || p === piEntryFor(root));
         if (entries.length === 0) return laneAbsent();
         // #2850: every npm spec form (plain / @pinned / @latest) resolves to
@@ -2379,8 +2399,7 @@ export async function pluginUpdate(agents: readonly PluginAgent[] | undefined, o
 
 async function updateLane(agent: PluginAgent, opts: PluginUpdateOpts, log: (level: "info" | "warn", msg: string) => void): Promise<string[]> {
     if (agent === "pi") {
-        const packages = readJson(piSettingsFile()).packages;
-        const list = Array.isArray(packages) ? (packages as unknown[]).map(String) : [];
+        const list = piPackageStrings(readJson(piSettingsFile()).packages);
         const root = selfPackageRoot();
         // #2850: versioned npm specs (@pinned/@latest) are the same pi-managed
         // copy, not a checkout pointer — route them to the same message.

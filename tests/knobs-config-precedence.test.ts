@@ -333,7 +333,8 @@ test("dump GC caps: default off, floors, explicit-off env wins (#2412)", () => {
 
 test("sessions warm/resident budgets: file tier + env precedence (#2803)", () => {
     clearConfig();
-    assert.equal(knobs.sessionWarmMax(), 8);
+    // #3050 R3 ②-0: warm set is off by default (lazy first touch) — set warmMax to opt back in
+    assert.equal(knobs.sessionWarmMax(), 0);
     assert.equal(knobs.sessionWarmMaxBytes(), 64 * 1024 * 1024);
     assert.equal(knobs.sessionResidentMaxBytes(), 512 * 1024 * 1024);
 
@@ -350,7 +351,7 @@ test("sessions warm/resident budgets: file tier + env precedence (#2803)", () =>
 
     // garbage / negative file values fall back to the defaults
     setConfig({ sessions: { warmMax: -2, warmMaxBytes: "big", residentMaxBytes: -1 } });
-    assert.equal(knobs.sessionWarmMax(), 8);
+    assert.equal(knobs.sessionWarmMax(), 0);
     assert.equal(knobs.sessionWarmMaxBytes(), 64 * 1024 * 1024);
     assert.equal(knobs.sessionResidentMaxBytes(), 512 * 1024 * 1024);
 
@@ -360,7 +361,7 @@ test("sessions warm/resident budgets: file tier + env precedence (#2803)", () =>
         assert.equal(knobs.sessionResidentMaxBytes(), 42);
     });
     withEnv({ BILI_SESSION_WARM_MAX: "garbage" }, () => {
-        assert.equal(knobs.sessionWarmMax(), 8);
+        assert.equal(knobs.sessionWarmMax(), 0);
     });
     clearConfig();
 });

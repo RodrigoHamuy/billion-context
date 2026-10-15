@@ -82,6 +82,26 @@ interface IngestPlan extends IngestSessionInput {
     tailSeqs: number[] | null;
 }
 
+/** #3133 test instrumentation: per-message JSON serializations performed by
+ *  the planners in this process (intern pass, delta probe, delta new-tail
+ *  pass). The watermark fix exists to make this O(new messages) per save
+ *  instead of O(full log) — the storage watermark tests assert exactly
+ *  that; production code never reads it. */
+export const ingestSerializations = { count: 0 };
+
+/** One messages-log entry with its ABSOLUTE seq already assigned (intern
+ *  assigns first-seen order; the delta planner continues after the trusted
+ *  prefix). */
+interface LogEntry {
+    seq: number;
+    msgId: string;
+    content: string;
+    hash: string;
+    role: string;
+    kind: string;
+    ref: string | null;
+}
+
 /** Adapts any Session-shaped object (persist loadSync output) to the
  *  ingest input type. Structural on purpose: no import of src/session.ts
  *  (avoids a module cycle through persist.ts). */
@@ -122,22 +142,132 @@ export function planIngest(session: LegacySessionLike): IngestPlan {
     const byRawRef = session.state.messageRefs.byRaw;
 
     // Pass 1: ordered union of identities (msg_id + content hash).
-    const log: { msgId: string; content: string; hash: string; ref: string | null }[] = [];
+    // #3133: no cross-save memo — the wire entry points replace the message
+    // array with freshly parsed objects on every request, so an object-
+    // identity WeakMap never hits on the production save path. The cost cut
+    // lives in planIngestDelta + the sessions.last_ingested_seq watermark.
+    const log: LogEntry[] = [];
     const seqByIdentity = new Map<string, number>();
     const intern = (m: CoreMessage): number => {
         const content = JSON.stringify(m);
-        const hash = sha256Hex(content);
-        const key = `${m.id}\u0000${hash}`;
+        ingestSerializations.count++;
+        const parsed = JSON.parse(content) as { role: string; contentType?: string };
+        const entry = { msgId: m.id, content, hash: sha256Hex(content), role: parsed.role, kind: parsed.contentType ?? "message" };
+        const key = `${m.id}\u0000${entry.hash}`;
         const existing = seqByIdentity.get(key);
         if (existing !== undefined) return existing;
         const seq = log.length;
         seqByIdentity.set(key, seq);
-        log.push({ msgId: m.id, content, hash, ref: byRawRef[m.id] ?? null });
+        log.push({ seq, msgId: m.id, content: entry.content, hash: entry.hash, role: entry.role, kind: entry.kind, ref: byRawRef[m.id] ?? null });
         return seq;
     };
     const pluginSnapshotSeqs = session.pluginSnapshot ? session.pluginSnapshot.map(intern) : null;
     const tailSeqs = session.lastMessages ? session.lastMessages.map(intern) : null;
 
+    return finishPlan(session, byRawRef, log, pluginSnapshotSeqs, tailSeqs);
+}
+
+/** #3133 fast-path planner: build the ingest plan for a session whose
+ *  stored tail is a VERIFIED trusted prefix — the sessions row's watermark
+ *  names the absolute seq backing the LAST tail message at save time, and
+ *  `trustedTailSeqs` is that save's persisted tailSeqs (same transaction
+ *  wrote both, so they cannot disagree). Soundness of skipping rows 0..L-1:
+ *  every one of them was part of the tail that set the watermark (rows
+ *  written by that save), and the probe pins slot L-1 to row `watermark`
+ *  with nothing above it — so this save only has to append tail[L..] at
+ *  watermark+1, watermark+2, … Only messages PAST the trusted prefix pay
+ *  stringify+hash; every other row family is byte-identical to
+ *  planIngest's, so the resulting store state equals a full ingest's.
+ *
+ *  Returns null (→ full ingest) when: a pluginSnapshot is present (its
+ *  entries may dedup against the trusted prefix and renumber the log),
+ *  the tail is absent or not longer than the trusted prefix (shrunk /
+ *  rewound / folded-in-place), or the boundary identity disagrees with the
+ *  tail slot at L-1 (edited/deleted/re-minted history). Interior edits
+ *  BELOW the boundary are the watermark design's accepted trade-off — they
+ *  never mis-attribute, only leave stale rows, and the sampled verify
+ *  digest is the backstop. */
+export function planIngestDelta(
+    session: LegacySessionLike,
+    watermark: number,
+    trustedTailSeqs: number[],
+    boundary: { msgId: string; contentHash: string },
+    hasRawTail: boolean,
+): IngestPlan | null {
+    if (session.pluginSnapshot && session.pluginSnapshot.length > 0) return null;
+    const tail = session.lastMessages;
+    const trustedLen = trustedTailSeqs.length;
+    if (
+        !tail ||
+        trustedLen === 0 ||
+        !Number.isSafeInteger(watermark) ||
+        watermark < 0 ||
+        // An equal-length tail is a VALID empty delta, but ONLY on the raw
+        // lineage: a caller passing the envelope's bounded folded RE-RENDER
+        // (no rawTail — e.g. the stale-convergence record(disk) path) may
+        // present the SAME identities in a DIFFERENT order (#2960 ⑤: the
+        // table holds the raw tail; the envelope re-renders it folded), and
+        // the boundary probe can match while the served view would stay on
+        // the raw ordering instead of the envelope render the disk record
+        // promised. Envelope renders must fall through to the full ingest,
+        // which rebuilds tailSeqs in the envelope's order.
+        (tail.length === trustedLen && !hasRawTail) ||
+        tail.length < trustedLen ||
+        trustedTailSeqs[trustedLen - 1] !== watermark
+    ) {
+        return null;
+    }
+    // Boundary probe, content side: ONE serialization+hash of the tail slot
+    // at the trusted prefix's end. Identities are content-derived and
+    // unique within one conversion pass, so a match proves this tail slot
+    // IS the message the watermark was set from.
+    const probe = JSON.stringify(tail[trustedLen - 1]);
+    ingestSerializations.count++;
+    if (tail[trustedLen - 1].id !== boundary.msgId || sha256Hex(probe) !== boundary.contentHash) return null;
+    const byRawRef = session.state.messageRefs.byRaw;
+    const log: LogEntry[] = [];
+    const appended: number[] = [];
+    for (let i = trustedLen; i < tail.length; i++) {
+        const m = tail[i];
+        const content = JSON.stringify(m);
+        ingestSerializations.count++;
+        const parsed = JSON.parse(content) as { role: string; contentType?: string };
+        // Placeholder seqs under the aligned assumption (no rows above the
+        // watermark); ingestSession renumbers from max(seq)+1 inside the
+        // transaction when a fold left rows above the trusted tip.
+        const seq = watermark + 1 + log.length;
+        appended.push(seq);
+        log.push({
+            seq,
+            msgId: m.id,
+            content,
+            hash: sha256Hex(content),
+            role: parsed.role,
+            kind: parsed.contentType ?? "message",
+            ref: byRawRef[m.id] ?? null,
+        });
+    }
+    // planIngest's snapshot ternary replicated on the ORIGINAL value: an
+    // array (even empty, as fork receipts carry) maps to [], null stays
+    // null — loadLegacyView distinguishes the two, so they must not collapse.
+    const pluginSnapshotSeqs = session.pluginSnapshot ? [] : null;
+    // tailSeqs stay ABSOLUTE (the trusted prefix's seqs are the stored ones,
+    // holes included — folding removes log positions from the middle); the
+    // delta path skips remapPlanToAbsolute by construction.
+    const tailSeqs = [...trustedTailSeqs, ...appended];
+    return finishPlan(session, byRawRef, log, pluginSnapshotSeqs, tailSeqs);
+}
+
+/** Shared plan tail (everything except the messages log): byte-identical
+ *  output for both planners — the watermark fast path must not change what
+ *  a full ingest would write for the same session. */
+function finishPlan(
+    session: LegacySessionLike,
+    byRawRef: Record<string, string>,
+    log: LogEntry[],
+    pluginSnapshotSeqs: number[] | null,
+    tailSeqs: number[] | null,
+): IngestPlan {
     // Ref ledger: verbatim, ordered by the persisted map's key order.
     // Ghost ids (dead refs) have rows here and nowhere else — by design.
     const refs: RefRow[] = Object.entries(byRawRef).map(([rawId, ref], ord) => ({
@@ -147,14 +277,15 @@ export function planIngest(session: LegacySessionLike): IngestPlan {
         refNum: refToIndex(ref),
     }));
 
-    const messages: MessageRow[] = log.map((e, seq) => ({
-        seq,
+    const messages: MessageRow[] = log.map((e) => ({
+        seq: e.seq,
         msgId: e.msgId,
         ref: e.ref,
         refNum: e.ref === null ? null : refToIndex(e.ref),
-        role: (JSON.parse(e.content) as { role: string }).role,
-        kind: (JSON.parse(e.content) as { contentType?: string }).contentType ?? "message",
+        role: e.role,
+        kind: e.kind,
         content: e.content,
+        contentHash: e.hash,
     }));
 
     const blocks: BlockRow[] = session.state.blocks.map((b, ord) => {

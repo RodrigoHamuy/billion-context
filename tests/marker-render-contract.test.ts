@@ -79,6 +79,20 @@ test("render contract: every report variant is consumed whole (SECTION_HEADS can
     }
 });
 
+test("render contract: pre-compaction archive sections are consumed whole (#3105)", () => {
+    const { ctx } = makeCtx();
+    const archive: Record<string, { at: number; reason: string }> = {};
+    for (let i = 1; i <= 60; i++) archive[`b${i}`] = { at: i, reason: "covered substrate destroyed by unannounced client history rewrite (#2695)" };
+    ctx.session.metadata.preCompactionArchive = archive;
+    for (const args of [{}, { archiveDetail: true }] as Record<string, unknown>[]) {
+        const report = handleAcpStatus(args, ctx).text;
+        assert.match(report, /PRE-COMPACTION ARCHIVE/);
+        const standalone = consumeAcpStatusBody(echo(report));
+        assert.equal(standalone.bodies, 1, `${JSON.stringify(args)}: head + body recognized`);
+        assert.equal(standalone.text.trim(), "", `${JSON.stringify(args)}: whole report consumed (residual: ${JSON.stringify(standalone.text.slice(0, 160))})`);
+    }
+});
+
 test("render contract: consumer leaves non-report marker lines alone", () => {
     // A bare head with no report grammar behind it (plain marker line) is
     // owned by MARKER_LINE, not this consumer.

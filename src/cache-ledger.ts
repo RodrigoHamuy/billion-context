@@ -376,12 +376,21 @@ const BODY_FULL_CAP = 8 * 1024 * 1024;
  *  `null` = unknown (wire shape without a message array). `digest` hashes the
  *  FULL body (the capped head cannot distinguish two payloads sharing 512 KiB);
  *  `full` keeps the whole payload while it fits BODY_FULL_CAP so divergent
- *  pairs can report their first-diverging byte offset. */
+ *  pairs can report their first-diverging byte offset. #2868: bodies are kept
+ *  as UTF-8 Buffers — every cap, LCP and tolerance in this file is BYTES, and
+ *  the capture-time encoding is reused instead of re-encoded per comparison
+ *  (a code-unit LCP misreported CJK offsets by up to 3×, and slicing a string
+ *  then re-encoding cannot repair it: distinct codepoints share leading
+ *  UTF-8 bytes). #2923: slots live under session.transient so the retained
+ *  copies release with the session. */
 export interface SeamSlot {
-    str: string;
+    /** Capped head (≤ SEAM_BODY_CAP bytes) — seam forensics + JSON parse side. */
+    head: Buffer;
+    /** Exact outbound body size in bytes — precise cap/full detection. */
+    bytes: number;
     msgs: number | null;
     digest: string;
-    full: string | null;
+    full: Buffer | null;
     /** #2131: credential fingerprint of the headers that carried THIS body out.
      *  Preserved across byte-identical re-notes (the non-streaming settle
      *  re-notes the same wireBody without headers in hand). */
@@ -530,23 +539,26 @@ export function credentialFingerprint(headers: Record<string, string> | undefine
  *  the outbound credential fingerprint (#2131) — likewise inherited from the
  *  prior slot on a byte-identical re-note without a fresh capture. */
 export function noteForwardedBody(session: Session, body: string, msgs?: number | null, keyFp?: string): void {
-    // V8 的 substring 可保留整个请求；UTF-16 拷贝独立分配且保留孤立 surrogate。
-    const str = Buffer.from(body.slice(0, SEAM_BODY_CAP), "utf16le").toString("utf16le");
+    // #2868: encode to UTF-8 ONCE here — digest, capped head and retained full
+    // body all consume this same buffer, so no later comparison re-encodes.
+    // Caps are BYTES (the old code-unit caps overshot them up to 3× on CJK).
+    // The buffer is a fresh allocation and nothing below retains `body` itself
+    // (#2923: the request string releases once this returns).
     // #2131: hash the FULL body — the capped head alone cannot tell two payloads
     // sharing a 512 KiB prefix apart. Re-noting a byte-identical payload (the
     // non-streaming settle path) reuses the prior slot's count/full instead of
     // re-deriving them.
-    const digest = createHash("sha256").update(body, "utf8").digest("hex");
+    const buf = Buffer.from(body, "utf8");
+    const digest = createHash("sha256").update(buf).digest("hex");
     const transient = session.transient ??= {};
     const prior = transient.sentBody;
     const samePayload = prior !== undefined && prior.digest === digest;
     transient.sentBody = {
-        str,
+        head: buf.byteLength > SEAM_BODY_CAP ? Buffer.from(buf.subarray(0, SEAM_BODY_CAP)) : buf,
+        bytes: buf.byteLength,
         msgs: msgs ?? (samePayload ? prior.msgs : null),
         digest,
-        full: body.length <= SEAM_BODY_CAP ? str
-            : body.length <= BODY_FULL_CAP ? Buffer.from(body, "utf16le").toString("utf16le")
-            : samePayload ? prior.full : null,
+        full: buf.byteLength <= BODY_FULL_CAP ? buf : samePayload ? prior.full : null,
         keyFp: keyFp ?? (samePayload ? prior.keyFp : undefined),
     };
     // prepare may reuse a measured baseline; this new payload is not measured yet.
@@ -622,19 +634,23 @@ export function learnedImageReserve(session: Session, host: string, nImages: num
     return per * nImages;
 }
 
-function seamLcp(a: string, b: string): { lcpBytes: number; msgIndex: number | null; prevMsgs: number; curMsgs: number } {
+// #2868: compares UTF-8 BYTES — lcpBytes feeds byte thresholds and displays,
+// so comparing UTF-16 code units misreported every non-ASCII offset.
+function seamLcp(a: Buffer, b: Buffer): { lcpBytes: number; msgIndex: number | null; prevMsgs: number; curMsgs: number } {
     let lcp = 0;
     const n = Math.min(a.length, b.length);
-    while (lcp < n && a.charCodeAt(lcp) === b.charCodeAt(lcp)) lcp++;
+    while (lcp < n && a[lcp] === b[lcp]) lcp++;
     // #2339: the message array lives under `messages` (Anthropic/chat), `input`
     // (Responses) or `contents` (Google native) — same caliber as the send-time
     // count captures (server.ts / loop/core.ts). Reading only `.messages` made
     // every Responses/Google pair parse to zero messages: msgIndex degenerated
     // to a fallback 0 that rendered as a real "message[0]", and the count-based
-    // classification arms went dead on those wires.
-    const msgsOf = (s: string): unknown[] => {
+    // classification arms went dead on those wires. A capped head may end mid
+    // character; toString("utf8") replaces it and the truncated JSON fails to
+    // parse — the same outcome as before #2868.
+    const msgsOf = (s: Buffer): unknown[] => {
         try {
-            const p = JSON.parse(s) as { messages?: unknown; input?: unknown; contents?: unknown };
+            const p = JSON.parse(s.toString("utf8")) as { messages?: unknown; input?: unknown; contents?: unknown };
             const arr = p.messages ?? p.input ?? p.contents;
             return Array.isArray(arr) ? arr : [];
         } catch {
@@ -654,10 +670,13 @@ function seamLcp(a: string, b: string): { lcpBytes: number; msgIndex: number | n
 // #2131: byte-LCP WITHOUT the JSON parse seamLcp does — the per-call stability
 // check runs on every settled pair and must stay cheap on multi-MiB bodies
 // (message-level detail belongs to detectSeam's forensics path only).
-function byteLcp(a: string, b: string): number {
+// #2868: real bytes over the capture-time buffers — the old charCodeAt loop
+// returned UTF-16 code units, so CJK offsets were short by up to 3× and the
+// 1024-byte head threshold / ±64-byte append tolerance misfired on them.
+function byteLcp(a: Buffer, b: Buffer): number {
     let lcp = 0;
     const n = Math.min(a.length, b.length);
-    while (lcp < n && a.charCodeAt(lcp) === b.charCodeAt(lcp)) lcp++;
+    while (lcp < n && a[lcp] === b[lcp]) lcp++;
     return lcp;
 }
 
@@ -668,7 +687,14 @@ function byteLcp(a: string, b: string): number {
 // re-serialized element offsets do not match the original text (whitespace),
 // and one linear pass keeps multi-MiB bodies cheap. Runs only on pairs that
 // would otherwise class "mid" — the hot path never pays for it.
-function messagesArrayCloseOffset(body: string): number | null {
+// #2868: scans the UTF-8 Buffer directly, returning a BYTE offset comparable
+// to byteLcp's result. Safe on multi-byte content: every delimiter checked
+// here (quotes/backslash/braces/brackets/whitespace ≤0x20) is ASCII, and
+// UTF-8 continuation bytes (0x80–0xBF) and lead bytes (0xC0+) can never
+// equal an ASCII code point — a multi-byte character cannot hide or fake a
+// delimiter. Escapes consume exactly one following byte, matching valid JSON
+// where the escaped char after '\' is always ASCII.
+function messagesArrayCloseOffset(body: Buffer): number | null {
     const n = body.length;
     let depth = 0; // object/array nesting depth
     let inStr = false;
@@ -676,7 +702,7 @@ function messagesArrayCloseOffset(body: string): number | null {
     let want = -1; // depth at which the tracked array closes (-1 = not tracking)
     let keyAt = -1; // opening-quote offset of a candidate top-level key
     for (let i = 0; i < n; i++) {
-        const c = body.charCodeAt(i);
+        const c = body[i];
         if (inStr) {
             if (esc) esc = false;
             else if (c === 92) esc = true; // backslash
@@ -684,17 +710,17 @@ function messagesArrayCloseOffset(body: string): number | null {
                 inStr = false;
                 if (keyAt >= 0) {
                     // +1/-1 strip the surrounding quotes from the captured range.
-                    const key = body.slice(keyAt + 1, i);
+                    const key = body.subarray(keyAt + 1, i).toString("utf8");
                     keyAt = -1;
                     // A top-level string VALUE is also seen at depth 1 — the
                     // following-colon check below is what separates keys from it.
                     if (depth === 1 && (key === "messages" || key === "input" || key === "contents")) {
                         let j = i + 1;
-                        while (j < n && body.charCodeAt(j) <= 32) j++;
-                        if (body.charCodeAt(j) === 58) { // ':'
+                        while (j < n && body[j] <= 32) j++;
+                        if (body[j] === 58) { // ':'
                             j++;
-                            while (j < n && body.charCodeAt(j) <= 32) j++;
-                            if (body.charCodeAt(j) === 91) want = depth + 1; // '['
+                            while (j < n && body[j] <= 32) j++;
+                            if (body[j] === 91) want = depth + 1; // '['
                         }
                     }
                 }
@@ -751,12 +777,13 @@ function detectSeam(session: Session, led: CacheLedger): void {
     };
     let f: ReturnType<typeof seamLcp> | undefined;
     if (cur !== undefined && prev !== undefined) {
-        f = seamLcp(prev.str, cur.str);
+        f = seamLcp(prev.head, cur.head);
         // #2131: a body stored at full length is readable; one clipped at
         // SEAM_BODY_CAP parses to zero messages, so parse-derived arms below
-        // only decide pairs where that side is under the cap.
-        const prevCapped = prev.str.length >= SEAM_BODY_CAP;
-        const curCapped = cur.str.length >= SEAM_BODY_CAP;
+        // only decide pairs where that side is under the cap. #2868: capped
+        // means CLIPPED (bytes > cap) — an exactly-at-cap body is fully stored.
+        const prevCapped = prev.bytes > SEAM_BODY_CAP;
+        const curCapped = cur.bytes > SEAM_BODY_CAP;
         // Client reverted/trimmed history: the miss is the sanctioned
         // one-time re-bill of the retained prefix (or the gap's TTL). Only
         // trust the parsed counts when BOTH sides are fully stored — a side
@@ -768,7 +795,7 @@ function detectSeam(session: Session, led: CacheLedger): void {
             agg.rewindMissed += line.tr;
             return;
         }
-        if (cur.str.length < prev.str.length && f.lcpBytes >= cur.str.length - 4) {
+        if (cur.head.byteLength < prev.head.byteLength && f.lcpBytes >= cur.head.byteLength - 4) {
             // #2131: the WHOLE current payload survives inside the previous
             // one — a JSON array only diverges from its own longer superstring
             // in the closing-bracket region (the 4-byte tolerance), so this is
@@ -780,7 +807,7 @@ function detectSeam(session: Session, led: CacheLedger): void {
             agg.rewindMissed += line.tr;
             return;
         }
-        if (f.lcpBytes >= cur.str.length) {
+        if (f.lcpBytes >= cur.head.byteLength) {
             // Wire was byte-stable against the previous request — the
             // upstream simply did not serve its cache. Provider-side. Above
             // the cap this covers the identical-recorded-head case: anything
@@ -801,7 +828,7 @@ function detectSeam(session: Session, led: CacheLedger): void {
             bookProvider();
             return;
         }
-        if (prev.str.length < cur.str.length && f.lcpBytes >= prev.str.length - 4) {
+        if (prev.head.byteLength < cur.head.byteLength && f.lcpBytes >= prev.head.byteLength - 4) {
             // #2131: the WHOLE previous payload survives inside the longer
             // current one (JSON appends diverge only in the previous body's
             // closing-bracket region — the 4-byte tolerance). Under the cap the
@@ -837,7 +864,7 @@ function detectSeam(session: Session, led: CacheLedger): void {
             const m = curIn.meta[k] ?? { role: "?", len: 0, cls: "?" };
             if (cur !== undefined && prev !== undefined) {
                 if (led.seamEvents !== undefined && led.seamEvents.length >= SEAM_EVENTS_CAP) led.seamEvents.shift();
-                const forensics = f ?? seamLcp(prev.str, cur.str);
+                const forensics = f ?? seamLcp(prev.head, cur.head);
                 (led.seamEvents ?? (led.seamEvents = [])).push({ seq: line.seq, at: line.at, input: line.input, hitPct: line.hitPct ?? 0, ...forensics, prevMsgs: prev.msgs ?? forensics.prevMsgs, curMsgs: cur.msgs ?? forensics.curMsgs, client: { idx: k, role: m.role, len: m.len, cls: m.cls } });
             }
             if (agg.clientInserts === 1) {
@@ -855,7 +882,7 @@ function detectSeam(session: Session, led: CacheLedger): void {
         led.seamEvents.shift();
     }
     if (cur !== undefined && prev !== undefined) {
-        const forensics = f ?? seamLcp(prev.str, cur.str);
+        const forensics = f ?? seamLcp(prev.head, cur.head);
         const ev: SeamEvent = { seq: line.seq, at: line.at, input: line.input, hitPct: line.hitPct ?? 0, ...forensics, prevMsgs: prev.msgs ?? forensics.prevMsgs, curMsgs: cur.msgs ?? forensics.curMsgs };
         (led.seamEvents ?? (led.seamEvents = [])).push(ev);
         if (agg.seamSuspects === 1) {
@@ -1336,6 +1363,10 @@ export function settleUsageReport(
         // compaction boundaries via resetSessionCompression (session.ts).
         session.stats.lastUsageGradeTokens = session.stats.lastInputTokens;
         session.stats.lastInputTokensSource = "usage";
+        // #3148: a real usage report supersedes the failed-round arm — drop the
+        // visibility marker so acp_status stops advertising a stale emergency state.
+        delete session.stats.emergencyShrinkAt;
+        delete session.stats.emergencyShrinkEstimate;
         session.stats.contextTokens = session.stats.lastInputTokens;
         session.stats.contextTokensSource = "usage";
         if (session.metadata) session.metadata.contextTokensAt = Date.now();
@@ -1350,6 +1381,13 @@ export function settleUsageReport(
         // per-origin ring; the factor is published only once ≥2 recent samples
         // agree within ×2, and cleared again when they stop agreeing — until
         // then the raw estimate decides (legacy behavior).
+        // #3211: per-route calibration policy (providers[<key>].calibration),
+        // paired by handle.ts with the SAME latest-wins/origin-gated discipline
+        // as the pending estimate — applied below at PUBLICATION time only, so
+        // the learned ring stays raw and auditable. Origin mismatch (slot set
+        // by a request on another route) voids it for this settle.
+        const pendingCalibOrigin = session.stats.lastCalibrationPolicyOrigin !== undefined ? normalizeUpstreamOrigin(session.stats.lastCalibrationPolicyOrigin) : undefined;
+        const calibPolicy = pendingCalibOrigin === settleOrigin ? session.stats.lastCalibrationPolicy : undefined;
         const pendingEst = session.stats.lastLocalTextEstimate;
         const pendingOrigin = normalizeUpstreamOrigin(session.stats.lastLocalTextEstimateOrigin);
         if (pendingEst !== undefined && pendingEst >= CALIBRATION_MIN_ESTIMATE && settleOrigin !== undefined && pendingOrigin === settleOrigin) {
@@ -1377,12 +1415,23 @@ export function settleUsageReport(
                 const spread = Math.max(...ring.values) / Math.min(...ring.values);
                 if (ring.values.length >= 2 && spread <= CALIBRATION_CONSISTENCY_RATIO) {
                     const mean = ring.values.reduce((a, b) => a + b, 0) / ring.values.length;
-                    session.stats.calibratedEstimate = Math.min(CALIBRATION_CLAMP_MAX, Math.max(CALIBRATION_CLAMP_MIN, mean));
-                    session.stats.calibratedEstimateOrigin = settleOrigin;
-                    // Provenance is the ring's model key, not this sample's stamp —
-                    // an unknown-model settle continues a model-keyed ring without
-                    // blanking the established provenance.
-                    session.stats.calibratedEstimateModel = ring.model;
+                    if (calibPolicy?.disabled === true) {
+                        // #3211: route-level opt-out — the learned value stays in
+                        // the ring (auditable) but is never applied on this route.
+                        delete session.stats.calibratedEstimate;
+                        delete session.stats.calibratedEstimateOrigin;
+                        delete session.stats.calibratedEstimateModel;
+                    } else {
+                        const clamped = Math.min(CALIBRATION_CLAMP_MAX, Math.max(CALIBRATION_CLAMP_MIN, mean));
+                        session.stats.calibratedEstimate = calibPolicy?.max !== undefined ? Math.min(clamped, calibPolicy.max) : clamped;
+                        session.stats.calibratedEstimateOrigin = settleOrigin;
+                        // Provenance is the ring's model key, not this sample's stamp —
+                        // an unknown-model settle continues a model-keyed ring without
+                        // blanking the established provenance. Stays inside the publish
+                        // branch: the disabled path above clears all three fields and
+                        // must not re-stamp one of them (#3211 review).
+                        session.stats.calibratedEstimateModel = ring.model;
+                    }
                 } else {
                     delete session.stats.calibratedEstimate;
                     delete session.stats.calibratedEstimateOrigin;

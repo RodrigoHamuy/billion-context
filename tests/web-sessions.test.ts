@@ -10,6 +10,7 @@ import type { CompressionBlock } from "acp-kernel";
 import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
+import { VERSION } from "../src/version.ts";
 import type { Session } from "../src/session.ts";
 import { getSession, _resetSessionsForTest } from "../src/session.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
@@ -329,6 +330,19 @@ withSessionsDir("session detail surfaces the per-file storage-mode stamp (#2671)
     assert.equal((await buildSessionDetail("sm-default"))?.storageMode, "shadow", "absent everywhere now defaults to shadow");
     assert.equal((await buildSessionDetail("sm-full"))?.storageMode, "full");
     assert.equal((await buildSessionDetail("sm-blocked"))?.storageMode, "legacy", "blocked-by-encryption writes no db copy → stamps legacy");
+});
+
+withSessionsDir("#3093: live (never-persisted) sessions carry the provenance stamps", async (_dir) => {
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    _resetDiskCacheForTest();
+    // Suite baseline pins BILI_STORAGE_UNIFIED=legacy against an empty config file.
+    const live = getSession("live-stamp", { protocol: "openai" });
+    assert.equal(live.metadata["storageMode"], "legacy");
+    assert.equal(live.metadata["biliVersion"], VERSION);
+    const d = await buildSessionDetail("live-stamp");
+    assert.ok(d && d.live, "detail resolves the resident session without touching disk");
+    assert.equal(d.storageMode, "legacy", "live detail shows the real mode instead of the frontend legacy fallback");
+    assert.equal(d.biliVersion, VERSION);
 });
 
 withSessionsDir("buildSessionDetail flags externally-summarized blocks", async (dir) => {

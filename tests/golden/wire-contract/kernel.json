@@ -1647,7 +1647,7 @@
       },
       "protectedTools": [],
       "protectedLatestTools": [],
-      "preserveRecentMessages": 5,
+      "preserveRecentMessages": 3,
       "preserveRecentTokens": 5000,
       "modelContextLimit": 100000,
       "absorb": {

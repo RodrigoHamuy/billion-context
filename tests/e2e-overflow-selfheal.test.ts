@@ -185,8 +185,10 @@ test("e2e #987/#1195 T1: a stated-window overflow arms the one-shot shrink, lear
         assert.equal(s2?.metadata.confirmedContextLimits, undefined, "still nothing learned after recovery");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });
@@ -256,8 +258,10 @@ test("e2e #987 T2: an overflow WITHOUT a window number arms at the declared wind
         assert.equal(summaryCalls, 0, "no fold");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });
@@ -333,8 +337,10 @@ test("e2e #987 T3: with a CORRECT declared window, an oversized turn still recov
         assert.ok(lastForward.includes(SUMMARY_TEXT), "the forwarded body carries the fold summary");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });

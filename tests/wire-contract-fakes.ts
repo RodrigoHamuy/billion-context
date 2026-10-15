@@ -21,11 +21,33 @@ export type Wire = "anthropic" | "openai-chat" | "responses" | "google";
 interface WireRule {
     readonly id: string;
     readonly wire: Wire;
+    /** Lane scope (e.g. "codex") — the constraint only holds on that client's lane, so its
+     *  enforcement lives in the lane's own fake, not in the wire's shared VALIDATOR. */
+    readonly lane?: string;
     readonly summary: string;
     readonly provenance: string;
 }
 
 export const WIRE_RULES: readonly WireRule[] = [
+    {
+        id: "WC-017",
+        wire: "responses",
+        lane: "codex",
+        summary:
+            "codex CLI Responses WebSocket create frames carry stream:true (required field in the client's WS request struct) plus optional stream_options — bili must forward both verbatim on the upstream egress; dropping them made chatgpt.com answer with a zero-output completed turn",
+        provenance:
+            "bili #3063 production silent failure (codex 0.162.0-alpha.17.2 through /bili/<chatgpt.com> prefix routing on bili 0.1.183+: upstream counted input tokens, produced zero output, turn ended completed; identical via --passthrough). Cross-checked against openai/codex source: codex-rs/codex-api/src/common.rs ResponseCreateWsRequest declares stream: bool as a required serialized field (no skip_serializing_if) and serializes stream_options when present; codex-rs/core/tests/suite/client_websockets.rs asserts body[\"stream\"] == true on the wire. Repair: src/responses-ws.ts re-attaches the client's transport fields at egress (egressTransportFields); supersedes WC-013's over-generalized scope for the codex lane.",
+    },
+    {
+        // #3159: landed as WC-017 on the feature branch; master's #3072 took
+        // that id first (codex lane), so this rule renumbers to WC-018 on rebase.
+        id: "WC-018",
+        wire: "google",
+        summary:
+            "Vertex rejects a request whose user content carries plain (unsigned, non-thought) text AFTER a functionResponse part — 400 'Requests ending with a model turn are not supported'; text-before-functionResponse is accepted. bili normalizes user-side part order at both boundaries: coreToGoogle's flushUser and appendGoogleNudge (stable partition of movable plain text ahead of non-text parts; signed/thought parts never move)",
+        provenance:
+            "bili #3159 production 400 (dsh-vertex-argon 1.1.4 / DSH 0.2.0-rc.2 over billion-context 0.1.196, official Vertex endpoint, gemini-4-argon generateContent): after a successful tool call the next request 400'd because Bili appended a plain-text nudge AFTER the trailing functionResponse part. Controlled A/B matrix on the official endpoint (issue table, 2026-10-14): [functionResponse]→200, [functionResponse, text]→400, [text, functionResponse]→200. The Gemini Developer API accepts both orders — the strictness is Vertex-specific.",
+    },
     {
         id: "WC-016",
         wire: "anthropic",
@@ -44,8 +66,8 @@ export const WIRE_RULES: readonly WireRule[] = [
     {
         id: "WC-013",
         wire: "responses",
-        summary: "Responses WebSocket requests use response.create and omit HTTP-only stream/background/stream_options fields",
-        provenance: "OpenAI WebSocket mode guide https://developers.openai.com/api/docs/guides/websocket-mode/ (transport-specific stream/background fields are not used); OpenCode v2.0.20 open-responses-channel.ts removes these fields; bili #1844 adds a WS transport rather than sending HTTP envelopes verbatim.",
+        summary: "OpenCode V2 Responses WebSocket requests use response.create and omit HTTP-only stream/background/stream_options fields — that client's contract; the codex CLI lane instead REQUIRES stream on create frames (see WC-017)",
+        provenance: "OpenAI WebSocket mode guide https://developers.openai.com/api/docs/guides/websocket-mode/ (transport-specific stream/background fields are not used); OpenCode v2.0.20 open-responses-channel.ts removes these fields; bili #1844 adds a WS transport rather than sending HTTP envelopes verbatim. Scope corrected per #3063 (2026-10-13): the rule was over-generalized from the OpenCode V2 client to all WS lanes — the codex CLI's own create frames carry stream:true as a required field, and chatgpt.com answers stream-less frames with a zero-output completed turn.",
     },
     {
         id: "WC-012",
@@ -432,10 +454,47 @@ export function validateResponsesWsCreate(body: unknown): string[] {
     return ["stream", "stream_options", "background"].filter(key => key in body).map(key => `WC-013: HTTP-only ${key} must not reach WebSocket response.create`);
 }
 
-/** WC-006 on a Gemini generateContent/streamGenerateContent body. */
+/** WC-017 on a codex-lane create frame: stream:true is REQUIRED (the client's request
+ *  struct declares it without skip_serializing_if) — the inverse of WC-013's opencode lane. */
+export function validateCodexResponsesWsCreate(body: unknown): string[] {
+    if (!isPlainObject(body) || body.type !== "response.create") return ["WC-017: expected response.create WebSocket event"];
+    const out: string[] = [];
+    if (body.stream !== true) out.push("WC-017: codex response.create must carry stream:true — required field in the codex WS request struct; dropping it made chatgpt.com answer with a zero-output completed turn (#3063)");
+    if (body.background !== undefined) out.push("WC-017: codex response.create must not carry background");
+    return out;
+}
+
+/** WC-006, WC-018 on a Gemini generateContent/streamGenerateContent body. */
 function validateGoogleBody(body: unknown): string[] {
     const out: string[] = [];
-    if (!isPlainObject(body) || !Array.isArray(body.tools)) return out;
+    if (!isPlainObject(body)) return out;
+    // WC-018: Vertex rejects a request whose user content carries plain
+    // (unsigned, non-thought) text AFTER a functionResponse part — 400
+    // "Requests ending with a model turn are not supported" (#3159). Runs
+    // before the tools early-return like every other contents-level rule.
+    if (Array.isArray(body.contents)) {
+        body.contents.forEach((content, i) => {
+            if (!isPlainObject(content) || content.role === "model") return;
+            if (!Array.isArray(content.parts)) return;
+            let seenFr = false;
+            content.parts.forEach((part, j) => {
+                if (!isPlainObject(part)) return;
+                if (part.functionResponse !== undefined) {
+                    seenFr = true;
+                    return;
+                }
+                if (
+                    seenFr &&
+                    typeof part.text === "string" &&
+                    part.thought !== true &&
+                    typeof part.thoughtSignature !== "string"
+                ) {
+                    out.push(`WC-018 contents[${i}].parts[${j}]: plain text part follows a functionResponse part — Vertex rejects user content ending on a model turn (#3159)`);
+                }
+            });
+        });
+    }
+    if (!Array.isArray(body.tools)) return out;
     body.tools.forEach((entry, i) => {
         if (!isPlainObject(entry) || !Array.isArray(entry.functionDeclarations)) return;
         entry.functionDeclarations.forEach((d, j) => {

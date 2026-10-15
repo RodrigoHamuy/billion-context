@@ -1,24 +1,8 @@
 name: e2e-native-pi
 
 on:
-  # #2637 plan #2: run when request-pipeline hot files (AGENTS.md §3) move;
-  # nightly (plan #3) keeps full daily coverage on master. pi-subagents is
-  # extra: this lane drives the acp_delegate tools shipped by that component.
+  # #3085: runs on every PR by default (reverts #2637's hot-file gate, which let untested changes ship).
   pull_request:
-    paths:
-      - "src/server.ts"
-      - "src/server/**"
-      - "src/loop/**"
-      - "src/compress-loop*.ts"
-      - "src/stream*.ts"
-      - "src/persist.ts"
-      - "src/session*.ts"
-      - "src/agent/**"
-      - "pi-subagents/**"
-      - "tests/e2e/**"
-      - "kernel/**"
-      - "package-lock.json"
-      - ".github/workflows/ci-e2e-native.yml"
   schedule:
     - cron: '30 16 * * *'
   workflow_dispatch:

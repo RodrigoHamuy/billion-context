@@ -275,7 +275,9 @@ test("#2672 halving midpoint on a protected message: halves snap past the BLOCKE
         assert.equal(sess?.metadata?.preflightDeadEnd, undefined, "successful preflight must not leave a dead-end marker");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         upstream.close();
+        upstream.closeIdleConnections?.();
         await Promise.all([once(proxy, "close"), once(upstream, "close")]);
     }
 });

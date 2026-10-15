@@ -282,8 +282,10 @@ test("integration: zombie plugin session degrades to proxy tool injection, then 
         assert.equal(healed!.metadata.selfHeal, undefined, "self-heal cleared on recovery");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });
@@ -313,8 +315,10 @@ test("integration: nudge-idle loop (non-plugin) suppresses the nudge after the w
         assert.ok(suppressed === before - 1, "nudge message gone once suppression armed (back to the un-nudged count)");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });
@@ -435,8 +439,10 @@ test("integration: a 524 on the non-streaming summary flips the session to strea
         assert.ok(lastForward.includes(SUMMARY_TEXT), "the fold summary made it into the rescued body");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });
@@ -467,6 +473,7 @@ test("unit: warnActivePluginSessions reports recent live sessions and stays sile
         if (prev === undefined) delete process.env.XDG_STATE_HOME;
         else process.env.XDG_STATE_HOME = prev;
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
         fs.rmSync(dir, { recursive: true, force: true });
     }

@@ -349,6 +349,20 @@ entries:
     group: behavior
     desc_en: "Ordered list of FOREIGN lane names a lane may ride when no own-lane instance exists (#2905). Own lane always wins first; the user zone (manual bili start, the 8787 global) is ALWAYS last; unlisted lanes stay non-attachable. File-only, no env var."
     desc_zh: "本 lane 没有自己的实例时可搭车的外部 lane 名字有序列表（#2905）。本 lane 永远第一；用户区（手动 bili start、8787 全局）永远最后；未列出的 lane 仍不可挂。仅配置文件，无 env。"
+  - key: native.attachPolicy
+    type: "\"own-lane\" | \"global-fallback\""
+    default: "own-lane"
+    env: BILI_NATIVE_ATTACH_POLICY
+    group: behavior
+    desc_en: "Lane affinity for native-hook attach, and the gate on whether any cross-lane riding happens (#2877). own-lane (default): a LANEd hook rides ONLY a same-lane daemon and, with none available, spawns its own instead of falling back onto a lane-less / manually-started bili start daemon or another lane's daemon (that convergence pinned every agent to one daemon's version and double-wrote sessions); an armed lane-less daemon (a managed shared proxy, #1225) stays shareable under either policy. global-fallback restores the pre-#2877 behavior: same-lane first, then a compatible lane-less/user-zone daemon, and (with attachLanePriority) the listed foreign lanes."
+    desc_zh: "native hook 附着的 lane 亲和，也是是否发生跨 lane 搭车的总闸（#2877）。own-lane（默认）：lane 型 hook 只搭同 lane 的守护；没有时自行派生，而不是回落到无 lane / 手动启动的 bili start 守护或其他 lane 的守护（那种汇聚会把所有 agent 钉死在一台守护的版本上并双写会话）；已武装的无 lane 守护（受管共享代理，#1225）在两种策略下都可被搭车。global-fallback 恢复 #2877 之前的行为：先同 lane，再兼容的无 lane/用户区守护，以及（配 attachLanePriority）列出的外部 lane。"
+  - key: native.attachUrl
+    type: string
+    default: "unset (discover per lane)"
+    env: BILI_MCP_PROXY
+    group: behavior
+    desc_en: "Explicit target origin for native-hook attach (any URL). When set, a hook attaches ONLY to that exact origin instead of auto-discovering, and spawns its own if it is not live; it must still be code-compatible and pass the lifecycle gate. The BILI_MCP_PROXY env var (also set by CLI --origin) takes precedence over this file value; empty/whitespace means unset."
+    desc_zh: "native hook 附着的显式目标源（任意 URL）。设置后，hook 只附着到该精确 origin 而不是自动发现，若其不在线则自行派生；仍需代码兼容并通过生命周期门禁。BILI_MCP_PROXY 环境变量（CLI --origin 亦会设置它）优先于此文件值；空/空白视为未设置。"
   - key: claude.nativePort
     type: number
     default: "unset (lane sticky zone port)"

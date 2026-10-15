@@ -48,7 +48,7 @@ test("first migration adopts legacy labels lazily while preserving historical by
     assert.deepEqual(readFileSync(file), before);
 }));
 
-test("cold state resumes transparently; corrupt matching state cannot become empty history", async () => fixture(async (dir, store) => {
+test("cold state resumes transparently; corrupt state no longer fails closed (#3157)", async () => fixture(async (dir, store) => {
     const session = createSession("ses_cold", { label: "ses_cold" });
     session.stats.requests = 42;
     await store.writeNow(session);
@@ -59,8 +59,8 @@ test("cold state resumes transparently; corrupt matching state cannot become emp
     await store.boot({ maxSessions: 1, maxBytes: 40000 });
     assert.equal(store.loadSync(session.id)?.stats.requests, 42);
     writeFileSync(path.join(cold, rel), "{broken");
-    assert.throws(() => store.loadSync(session.id));
-    assert.equal(readFileSync(path.join(cold, rel), "utf8"), "{broken");
+    // #3157: a corrupt state file must not make loadSync fail closed forever.
+    assert.doesNotThrow(() => store.loadSync(session.id));
 }));
 
 test("failed CCR save blocks state flush and retains dirty originals", async () => fixture(async (dir, store) => {
@@ -88,7 +88,7 @@ test("bounded server reads refuse corrupt originals without replacing them", asy
     assert.equal(readFileSync(file, "utf8"), broken);
 }));
 
-test("corrupt newly written live state overrides cold history and fails closed", async () => fixture(async (dir, store) => {
+test("corrupt newly written live state is quarantined and yields a fresh start (#3157)", async () => fixture(async (dir, store) => {
     const session = createSession("ses_live_corrupt", { label: "ses_live_corrupt" });
     await store.writeNow(session);
     const rel = relPathFor(session.id);
@@ -97,8 +97,12 @@ test("corrupt newly written live state overrides cold history and fails closed",
     renameSync(path.join(dir, rel), path.join(cold, rel));
     await store.boot({ maxSessions: 0, maxBytes: 0 });
     writeFileSync(path.join(dir, rel), "{broken new live state");
-    assert.throws(() => store.loadSync(session.id), /refusing an empty resume/);
-    assert.equal(readFileSync(path.join(dir, rel), "utf8"), "{broken new live state");
+    // #3157: a corrupt live state used to throw on every load (a permanent 502
+    // until a human deleted the file). loadSync must not throw now — the lane
+    // recovers (the unified index may still serve the session, or the corrupt
+    // file is quarantined and the session starts fresh). The quarantine detail
+    // is pinned in tests/issue3157-persist-durability.test.ts.
+    assert.doesNotThrow(() => store.loadSync(session.id));
 }));
 
 test("already-persisted sessions are retained when saving newer mutations fails", async () => fixture(async (_dir, store) => {

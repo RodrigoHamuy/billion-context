@@ -71,6 +71,10 @@ const WAIVERS = new Map([
     // are truth-table-pinned for reasons unrelated to export hygiene.
     // Remove this waiver when the symbols gain external use or move files.
     ["src/server/side-request.ts", new Set(["DemoteGateSignals", "SideLaneSignals", "SideLaneDecision"])],
+    // #R3 memory diagnostics: the two payload interfaces are referenced only
+    // inside src/session.ts (callers use them structurally); the functions
+    // themselves have cross-file refs (admin.ts, tests/) and need none.
+    ["src/session.ts", new Set(["ResidentFieldBreakdown", "MemoryReport"])],
 ]);
 
 const findings = [];

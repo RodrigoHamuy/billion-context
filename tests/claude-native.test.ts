@@ -28,10 +28,20 @@ import {
     stripClaudeManagedBlock,
 } from "../src/plugin-install.ts";
 import { ensureRootCA } from "../src/ca.ts";
-import { ZONE_PORT_BASE, resolveClaudeNativePort, resolveNativeAttachExternal, resolveNativeAttachLanePriority } from "../src/config.ts";
+import { ZONE_PORT_BASE, resolveClaudeNativePort, resolveNativeAttachExternal, resolveNativeAttachLanePriority, resolveNativeAttachPolicy, resolveNativeAttachUrl, resolveZonePortBase } from "../src/config.ts";
 import { chooseWatchdogParentPid, claudeNativeRoutingCheck, isClaudeHostArgv, isTransientShArgv, planClaudeNativeBootstrap, procTableExecOptions, readPsProcInfo, recordClaudeRoutingWarning, readWinProcInfo, resolveClaudeHostPid, splitWindowsCommandLine } from "../src/claude-native-bootstrap.ts";
 import { caDir, claudeRoutingWarningFile } from "../src/paths.ts";
 import { rmrf } from "./tmp-rm.ts";
+
+// #3182: under the CI zone-slot preload this file gets its own BILI_ZONE_PORT
+// band. Helpers that resolve from process.env (claudeNativeBaseUrl(), the
+// installer, planEnv spreads) follow the band; planClaudeNativeBootstrap({})
+// — literally "no environment at all" — stays on the exported default.
+// Every explicit child env below spreads ZONE_ENV so the hook, the manual
+// daemons and the attach scan all stay inside the band — concurrent live
+// files never see each other's zone (#3182/#3184/#3188).
+const ZONE_BAND_BASE = resolveZonePortBase();
+const ZONE_ENV = process.env.BILI_ZONE_PORT ? { BILI_ZONE_PORT: process.env.BILI_ZONE_PORT } : {};
 
 // #1248: the live tests below spawn real proxies/processes and observe real
 // /proc, ps output and network ports. On loaded shared machines (multi-agent
@@ -157,9 +167,9 @@ test("claudeNativeBaseUrl: default wraps api.anthropic.com; BILI_CLAUDE_UPSTREAM
         // #1660: no explicit override → the claude lane's zone preference
         // (sticky record > 18787 base) — readZonePort has no record in tests.
         assert.equal(claudeNativeBaseUrl().includes(`/bili/https://api.anthropic.com`), true);
-        assert.equal(claudeNativeBaseUrl(), `http://127.0.0.1:${ZONE_PORT_BASE}/bili/https://api.anthropic.com`);
+        assert.equal(claudeNativeBaseUrl(), `http://127.0.0.1:${ZONE_BAND_BASE}/bili/https://api.anthropic.com`);
         process.env.BILI_CLAUDE_UPSTREAM = "https://relay.example/";
-        assert.equal(claudeNativeBaseUrl(), `http://127.0.0.1:${ZONE_PORT_BASE}/bili/https://relay.example`);
+        assert.equal(claudeNativeBaseUrl(), `http://127.0.0.1:${ZONE_BAND_BASE}/bili/https://relay.example`);
     } finally {
         if (prev === undefined) delete process.env.BILI_CLAUDE_UPSTREAM;
         else process.env.BILI_CLAUDE_UPSTREAM = prev;
@@ -255,6 +265,69 @@ test("resolveNativeAttachLanePriority: ordered unique list; garbage degrades to 
         assert.deepEqual(resolveNativeAttachLanePriority(), [], "non-array degrades to [] — never a lone string");
         fs.writeFileSync(cfgFile, "{ not json");
         assert.deepEqual(resolveNativeAttachLanePriority(), [], "malformed file degrades to [], never throws");
+    } finally {
+        if (prev === undefined) delete process.env.XDG_CONFIG_HOME;
+        else process.env.XDG_CONFIG_HOME = prev;
+        rmrf(dir);
+    }
+});
+
+// #2877: discovery policy + explicit target — env wins over the config file;
+// default "own-lane" (a LANEd hook rides only its own lane, else spawns);
+// attachUrl unset unless an explicit origin is pinned.
+test("resolveNativeAttachPolicy: default own-lane; env/file select global-fallback", () => {
+    const prev = process.env.XDG_CONFIG_HOME;
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-attachpol-"));
+    const cfgDir = path.join(dir, "billion-context");
+    fs.mkdirSync(cfgDir, { recursive: true });
+    const cfgFile = path.join(cfgDir, "billion-context.json");
+    process.env.XDG_CONFIG_HOME = dir;
+    try {
+        assert.equal(resolveNativeAttachPolicy({}), "own-lane", "no env, no file → own-lane default");
+        assert.equal(resolveNativeAttachPolicy({ BILI_NATIVE_ATTACH_POLICY: "global-fallback" }), "global-fallback");
+        assert.equal(resolveNativeAttachPolicy({ BILI_NATIVE_ATTACH_POLICY: "GLOBAL-FALLBACK" }), "global-fallback", "case-insensitive + trimmed");
+        assert.equal(resolveNativeAttachPolicy({ BILI_NATIVE_ATTACH_POLICY: "global" }), "global-fallback", "shorthand alias");
+        assert.equal(resolveNativeAttachPolicy({ BILI_NATIVE_ATTACH_POLICY: "own-lane" }), "own-lane");
+        assert.equal(resolveNativeAttachPolicy({ BILI_NATIVE_ATTACH_POLICY: "strict" }), "own-lane", "strict == own-lane");
+        assert.equal(resolveNativeAttachPolicy({ BILI_NATIVE_ATTACH_POLICY: "bogus" }), "own-lane", "junk env falls back to default");
+
+        fs.writeFileSync(cfgFile, JSON.stringify({ native: { attachPolicy: "global-fallback" } }));
+        assert.equal(resolveNativeAttachPolicy({}), "global-fallback", "file selects global-fallback");
+        assert.equal(resolveNativeAttachPolicy({ BILI_NATIVE_ATTACH_POLICY: "strict" }), "own-lane", "env wins over file");
+
+        fs.writeFileSync(cfgFile, JSON.stringify({ native: { attachPolicy: "nonsense" } }));
+        assert.equal(resolveNativeAttachPolicy({}), "own-lane", "junk file value → default own-lane");
+
+        fs.rmSync(cfgFile);
+        assert.equal(resolveNativeAttachPolicy({}), "own-lane", "absent file → default own-lane");
+    } finally {
+        if (prev === undefined) delete process.env.XDG_CONFIG_HOME;
+        else process.env.XDG_CONFIG_HOME = prev;
+        rmrf(dir);
+    }
+});
+
+test("resolveNativeAttachUrl: env BILI_MCP_PROXY wins over file native.attachUrl; blank → unset", () => {
+    const prev = process.env.XDG_CONFIG_HOME;
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-attachurl-"));
+    const cfgDir = path.join(dir, "billion-context");
+    fs.mkdirSync(cfgDir, { recursive: true });
+    const cfgFile = path.join(cfgDir, "billion-context.json");
+    process.env.XDG_CONFIG_HOME = dir;
+    try {
+        assert.equal(resolveNativeAttachUrl({}), undefined, "no env, no file → unset (discover)");
+        assert.equal(resolveNativeAttachUrl({ BILI_MCP_PROXY: "http://127.0.0.1:9999" }), "http://127.0.0.1:9999", "env pin");
+        assert.equal(resolveNativeAttachUrl({ BILI_MCP_PROXY: "   " }), undefined, "blank env → unset");
+
+        fs.writeFileSync(cfgFile, JSON.stringify({ native: { attachUrl: "http://remote.example:8787" } }));
+        assert.equal(resolveNativeAttachUrl({}), "http://remote.example:8787", "file value used when env absent");
+        assert.equal(resolveNativeAttachUrl({ BILI_MCP_PROXY: "http://127.0.0.1:18788" }), "http://127.0.0.1:18788", "env wins over file");
+
+        fs.writeFileSync(cfgFile, JSON.stringify({ native: { attachUrl: "   " } }));
+        assert.equal(resolveNativeAttachUrl({}), undefined, "whitespace file value → unset");
+
+        fs.rmSync(cfgFile);
+        assert.equal(resolveNativeAttachUrl({}), undefined, "absent file → unset");
     } finally {
         if (prev === undefined) delete process.env.XDG_CONFIG_HOME;
         else process.env.XDG_CONFIG_HOME = prev;
@@ -681,7 +754,7 @@ test("installer round-trip: managed block + MCP face, then removal restores", ()
         assert.ok(fs.existsSync(box.settings));
         const after = JSON.parse(fs.readFileSync(box.settings, "utf8")) as { env?: Record<string, string>; hooks?: unknown };
         // #1660: no explicit port → the zone base is baked.
-        assert.equal(after.env?.ANTHROPIC_BASE_URL, baseUrlForPort(ZONE_PORT_BASE));
+        assert.equal(after.env?.ANTHROPIC_BASE_URL, baseUrlForPort(ZONE_BAND_BASE));
         assert.equal(after.env?.DISABLE_AUTO_COMPACT, "1");
         assert.equal(claudeNativeInstalled(), true);
         // #1902: the emitted hook must carry a bare `node` head — parseable by
@@ -829,7 +902,7 @@ test("install with an explicit port bakes it; without env the hook rides the zon
         delete planEnv.BILI_PROVIDER_REWRITES;
         delete planEnv.BILI_NATIVE_CLAUDE;
         delete planEnv.BILLION_CONTEXT_PLUGIN;
-        assert.deepEqual(planClaudeNativeBootstrap(planEnv), { action: "start", port: ZONE_PORT_BASE, strict: false }, "hook (no env) rides the zone, non-strict");
+        assert.deepEqual(planClaudeNativeBootstrap(planEnv), { action: "start", port: ZONE_BAND_BASE, strict: false }, "hook (no env) rides the zone, non-strict");
         pluginRemove("claude");
         assert.equal(claudeNativeInstalled(), false);
     } finally {
@@ -1108,6 +1181,7 @@ function runHook(distScript: string, port: number, xdg: Record<string, string>):
         const child = spawn(process.execPath, [distScript], {
             env: {
                 PATH: process.env.PATH ?? "/usr/bin:/bin",
+                ...ZONE_ENV,
                 HOME: xdg.home,
                 XDG_CONFIG_HOME: xdg.config,
                 XDG_STATE_HOME: xdg.state,
@@ -1148,6 +1222,12 @@ test("hook e2e: an occupied stable port fails loud — never port-hops", { timeo
     // claude model call on the dead original port (found live on the
     // host of issue #964: two test listeners on 48787/48788).
     const squatter = net.createServer();
+    // #3182 family (w22-3 CI red): the hook's probe of the port holder gets
+    // abruptly reset by this foreign listener; without a connection handler
+    // the accepted socket's ECONNRESET was unhandled and crashed the test
+    // process. Kill every connection eagerly — hostile squatter, and no
+    // stray socket events.
+    squatter.on("connection", (c) => c.destroy());
     squatter.listen(0, "127.0.0.1");
     await once(squatter, "listening");
     const port = (squatter.address() as net.AddressInfo).port;
@@ -1225,8 +1305,28 @@ async function rmHome(home: string): Promise<void> {
 // exercises the BUILT artifact (the hook command claude actually runs), so
 // build on demand when dist/ is absent (tsup ~1s; dev checkouts usually
 // already have dist/ from a prior build).
+/** #3182 family: a STALE dist is worse than a missing one — the test then
+ * exercises last week's product code and "fails" on fixes that exist (the
+ * #3044 marked-replacement hang was exactly this). Rebuild when any src/
+ * source is newer than the built entry. */
+function distStale(entry: string): boolean {
+    const root = path.resolve(import.meta.dirname, "..");
+    let newest = 0;
+    const walk = (dir: string): void => {
+        for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+            const p = path.join(dir, e.name);
+            if (e.isDirectory()) walk(p);
+            else if (/\.(ts|tsx)$/.test(e.name)) newest = Math.max(newest, fs.statSync(p).mtimeMs);
+        }
+    };
+    walk(path.join(root, "src"));
+    return fs.statSync(entry).mtimeMs < newest;
+}
+let distBuiltOnce = false;
 function ensureDistBuilt(distScript: string): void {
-    if (!fs.existsSync(distScript)) {
+    if (distBuiltOnce && fs.existsSync(distScript) && !distStale(distScript)) return;
+    distBuiltOnce = true;
+    if (!fs.existsSync(distScript) || distStale(distScript)) {
         const root = path.resolve(import.meta.dirname, "..");
         execFileSync(process.execPath, [path.join(root, "node_modules", "tsup", "dist", "cli-default.js")], { cwd: root, stdio: "pipe", timeout: 300_000 });
     }
@@ -1341,6 +1441,7 @@ test("hook e2e: watchdog tracks the claude host, not the transient sh wrapper", 
     const claudeProc = spawn(claudeBin, [], {
         env: {
             PATH: process.env.PATH ?? "/usr/bin:/bin",
+                ...ZONE_ENV,
             HOME: xdg.home,
             XDG_CONFIG_HOME: xdg.config,
             XDG_STATE_HOME: xdg.state,
@@ -1425,6 +1526,7 @@ test("watcher route: shared proxies take watcher registrations, daemons refuse (
         XDG_CACHE_HOME: xdg.cache,
         XDG_DATA_HOME: xdg.data,
         NO_COLOR: "1",
+        ...ZONE_ENV,
     };
     let armed = 0;
     let daemon = 0;
@@ -1499,7 +1601,7 @@ test("watcher route: shared proxies take watcher registrations, daemons refuse (
 // for lifecycle-less LANE'd squatters (unit-tested in launcher.test.ts) and
 // for non-bili listeners (spawn EADDRINUSE). Linux-only like the other hook
 // e2es (fake claude walks /proc).
-test("hook e2e: manual `bili start` on the pinned port is attached, not refused (#1322/#1335/#1660)", { timeout: 180_000, skip: LIVE_E2E ? process.platform !== "linux" : liveSkip }, async () => {
+test("hook e2e: manual `bili start` on the pinned port is refused loudly with guidance, never silently attached (#1322/#1335/#1660/#2877)", { timeout: 180_000, skip: LIVE_E2E ? process.platform !== "linux" : liveSkip }, async () => {
     const distCli = path.resolve(import.meta.dirname, "..", "dist", "index.js");
     const distScript = path.resolve(import.meta.dirname, "..", "dist", "claude-native-bootstrap.js");
     ensureDistBuilt(distCli);
@@ -1507,7 +1609,6 @@ test("hook e2e: manual `bili start` on the pinned port is attached, not refused 
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-claude-squatter-"));
     const xdg = { home, config: path.join(home, "cfg"), state: path.join(home, "state"), cache: path.join(home, "cache"), data: path.join(home, "data") };
     fs.mkdirSync(path.join(home, "tmp"), { recursive: true });
-    const port = await freePort();
     const instanceFile = path.join(xdg.state, "billion-context", "proxy-origin");
     const baseEnv = {
         PATH: process.env.PATH ?? "/usr/bin:/bin",
@@ -1517,11 +1618,24 @@ test("hook e2e: manual `bili start` on the pinned port is attached, not refused 
         XDG_CACHE_HOME: xdg.cache,
         XDG_DATA_HOME: xdg.data,
         NO_COLOR: "1",
+        ...ZONE_ENV,
     };
-    const squatter = spawnProxy(distCli, port, baseEnv);
+    // #3182: freePort() is bind-0-close — another process on the shared CI
+    // runner can steal the pick between probe and our bind (TOCTOU). A dead
+    // squatter is infra, not product: re-pick and retry the whole setup a
+    // bounded number of times before failing.
+    let port = 0;
+    let squatter = 0;
+    for (let attempt = 0; ; attempt++) {
+        port = await freePort();
+        squatter = spawnProxy(distCli, port, baseEnv);
+        if (await waitForPort(port, 60_000)) break;
+        killPid(squatter);
+        squatter = 0;
+        assert.ok(attempt < 2, `squatter daemon up on the stable port (port stolen ${attempt + 1}x, #3182 TOCTOU)`);
+    }
     let claudePid = 0;
     try {
-        assert.ok(await waitForPort(port, 60_000), "squatter daemon up on the stable port");
         assert.ok(
             await waitForProxyVisible(port, instanceFile, 60_000),
             "squatter fully visible to the attach machinery (health + identity record, #1903)",
@@ -1562,18 +1676,23 @@ test("hook e2e: manual `bili start` on the pinned port is attached, not refused 
         while (!fs.existsSync(doneFile) && Date.now() - t0 < 60_000) await new Promise((r) => setTimeout(r, 250));
         assert.ok(fs.existsSync(doneFile), "hook completed");
         const stderr = fs.readFileSync(errFile, "utf8");
-        // #1660: the manual daemon is user-zone — attach by default.
-        assert.match(stderr, /proxy attached at http:\/\/127\.0\.0\.1:\d+/, "hook attached to the user's daemon");
-        assert.doesNotMatch(stderr, /refusing to attach/, "no #1335 refusal for a user-maintained daemon");
-        assert.doesNotMatch(stderr, /bring-up failed/, "no fail-fast either — the port is owned by the user, not a lane");
-        // Non-destructive: killing the session must NOT take the daemon down.
+        // #2877 contract (supersedes the #1660 default for LANEd hooks): a
+        // claude-lane hook never rides a lane-less, unarmed daemon — every
+        // agent converging on one manual `bili start` was the disease. With
+        // the port strictly pinned the attach is refused LOUDLY and with
+        // guidance (kill the holder or opt in via attachExternal); nothing is
+        // killed, nothing re-bound — the user stays sovereign over their own
+        // daemon. The armed-shared exception is covered separately by the #7
+        // shared-proxy test below.
+        assert.match(stderr, /the #1335 attach gate refuses it by default/, "the refusal names the #1335 gate (#2877 own-lane default)");
+        assert.match(stderr, new RegExp(`port ${port} is held by a lifecycle-less bili proxy`), "the refusal names the user's daemon and port");
+        assert.match(stderr, /Kill that process \(kill \d+\) or set native\.attachExternal=true/, "actionable guidance: kill or attachExternal");
+        assert.match(stderr, /bring-up failed/, "fail-fast — no silent fallback onto another port");
+        // User sovereignty: the refusal is non-destructive.
         killPid(claudePid);
         claudePid = 0;
-        await new Promise((r) => setTimeout(r, 15_000));
-        assert.ok(await canConnect(port), "daemon survives session end — operator decides its fate");
-        const h = (await (await fetch(`http://127.0.0.1:${port}/__bili/health`)).json()) as { watchdog?: { armed?: boolean; watchers?: number[] } };
-        assert.equal(h.watchdog?.armed, false, "health explains the manual start (no session lifecycle)");
-        assert.deepEqual(h.watchdog?.watchers, [], "the session's watcher unregistered on exit");
+        await new Promise((r) => setTimeout(r, 5_000));
+        assert.ok(await canConnect(port), "the user's daemon survives untouched — operator decides its fate");
     } finally {
         if (claudePid > 1) killPid(claudePid);
         if (squatter > 1) killPid(squatter);

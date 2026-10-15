@@ -233,7 +233,9 @@ test("e2e #663 (order A, stream-first): learn both rejections, summary recovers,
         );
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         upstream.close();
+        upstream.closeIdleConnections?.();
         await new Promise<void>((resolve, reject) => {
             void Promise.allSettled([once(proxy, "close"), once(upstream, "close")]).then(() => resolve(), reject);
         });
@@ -276,7 +278,9 @@ test("e2e #663 (order B, param-first): max_output_tokens rejected before stream 
         assert.ok(calls.some((c) => !c.summary), "the folded payload was forwarded");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         upstream.close();
+        upstream.closeIdleConnections?.();
         await new Promise<void>((resolve, reject) => {
             void Promise.allSettled([once(proxy, "close"), once(upstream, "close")]).then(() => resolve(), reject);
         });
@@ -330,7 +334,9 @@ test("e2e #663 (standard provider): max_output_tokens retained, no capability le
         assert.equal(sess?.metadata?.preflightStreamSummary, undefined, "no stream learning for a standard provider");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         upstream.close();
+        upstream.closeIdleConnections?.();
         await new Promise<void>((resolve, reject) => {
             void Promise.allSettled([once(proxy, "close"), once(upstream, "close")]).then(() => resolve(), reject);
         });
@@ -391,7 +397,9 @@ test("e2e #663 (model scoping): rejection learned for model A keeps model B's 32
         assert.equal(learned?.[learnKey(upstreamUrl, "gpt-6-standard")], undefined, "model B key NOT learned");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         upstream.close();
+        upstream.closeIdleConnections?.();
         await new Promise<void>((resolve, reject) => {
             void Promise.allSettled([once(proxy, "close"), once(upstream, "close")]).then(() => resolve(), reject);
         });
@@ -461,7 +469,9 @@ test("e2e #663 (codex lite header): summary drops the Lite header, main request 
         }
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         upstream.close();
+        upstream.closeIdleConnections?.();
         await new Promise<void>((resolve, reject) => {
             void Promise.allSettled([once(proxy, "close"), once(upstream, "close")]).then(() => resolve(), reject);
         });
@@ -546,7 +556,9 @@ test("e2e #663 (anthropic): header strip is a no-op — summary keeps auth, fold
         }
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         upstream.close();
+        upstream.closeIdleConnections?.();
         await new Promise<void>((resolve, reject) => {
             void Promise.allSettled([once(proxy, "close"), once(upstream, "close")]).then(() => resolve(), reject);
         });

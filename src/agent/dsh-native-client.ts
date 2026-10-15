@@ -90,6 +90,59 @@ const PAGE_KEYS: Record<PageId, string> = {
 };
 const EMBED_HEIGHT = "min(640px, 78vh)";
 
+// #3100: pre-flight for the framed face. Auto-update refreshes the profile
+// bundle on DISK while the long-running proxy child keeps serving the code it
+// booted with — and this browser half always runs the freshest disk code — so
+// right after an update it frames a route the frozen server may not have yet
+// (the query form landed in v0.1.189; older builds answer it with a raw JSON
+// 404 inside the frame). Probe the exact embed URL once per origin BEFORE
+// mounting: HTML ⇒ mount the frame; any other answer ⇒ the running build
+// predates the route ⇒ show the restart notice instead (the backup button
+// targets the bare /__bili/ form every build serves). A network error yields
+// no verdict — the origin poll re-probes on its regular ticks. Verdicts are
+// cached per origin for the page lifetime: a frozen process cannot gain
+// routes mid-session.
+const EMBED_PROBE_PATH = "/__bili/?embed=1";
+type EmbedVerdict = "ok" | "stale";
+type EmbedState = { origin: string; verdict: EmbedVerdict };
+const embedVerdicts = new Map<string, EmbedVerdict>();
+const embedProbesInFlight = new Set<string>();
+
+function probeEmbedRoute(origin: string, onVerdict: (state: EmbedState) => void): void {
+    if (typeof fetch !== "function") return;
+    const cached = embedVerdicts.get(origin);
+    if (cached !== undefined) {
+        onVerdict({ origin, verdict: cached });
+        return;
+    }
+    if (embedProbesInFlight.has(origin)) return;
+    embedProbesInFlight.add(origin);
+    void fetch(`${origin}${EMBED_PROBE_PATH}`)
+        .then((res) => {
+            let html = false;
+            try {
+                const ct = typeof res.headers.get === "function" ? res.headers.get("content-type") : "";
+                html = res.ok && String(ct ?? "").includes("text/html");
+            } catch {
+                html = false;
+            }
+            const verdict: EmbedVerdict = html ? "ok" : "stale";
+            embedVerdicts.set(origin, verdict);
+            try {
+                void res.body?.cancel?.().catch(() => {});
+            } catch {
+                // non-stream body (harness): nothing to release
+            }
+            onVerdict({ origin, verdict });
+        })
+        .catch(() => {
+            // unreachable right now: no verdict, the next poll tick retries
+        })
+        .finally(() => {
+            embedProbesInFlight.delete(origin);
+        });
+}
+
 /** #2559: classify the host page's actual ground as light/dark. The framed
  *  bili face is a separate document — it only sees the browser/OS
  *  color-scheme, while dsh's dark theme is app-level. Same origin lets us
@@ -158,6 +211,8 @@ const zh: Dict = {
     "open": "打开 Web UI",
     "hint": "查看压缩状态、会话与上下文窗口。",
     "degraded": "当前 dsh 进程未绑定 bili 代理（未经 bili dsh 启动，或代理尚未就绪）——先运行 /acp，或改用 bili dsh 启动。",
+    "connecting": "正在连接 bili 代理…",
+    "stale": "运行中的 bili 代理比已安装的配置文件旧：本页面已加载新版界面，但代理进程仍在提供旧版服务，无法打开内嵌页面。请完全退出并重新启动 dsh 以加载新版本；重启前可点下方按钮直接打开 Web UI。",
     "tab_overview": "总览",
     "tab_sessions": "会话",
     "tab_config": "配置",
@@ -170,6 +225,8 @@ const en: Dict = {
     "open": "Open Web UI",
     "hint": "Inspect compression status, sessions and context windows.",
     "degraded": "This dsh process is not bound to a bili proxy (not launched via bili dsh, or the proxy is not up yet) — run /acp first, or launch through bili dsh.",
+    "connecting": "Connecting to the bili proxy…",
+    "stale": "The running bili proxy is older than the installed profile: this page already runs the new face, but the proxy process still serves the old build and cannot open the embedded page. Fully quit and relaunch dsh to load the new version; until then, use the button below to open the Web UI directly.",
     "tab_overview": "Overview",
     "tab_sessions": "Sessions",
     "tab_config": "Config",
@@ -196,7 +253,7 @@ function openExternal(url: string): void {
  *  a fresh theme pin — mid-session theme toggles land within one slow phase.
  *  No extra timers are scheduled here (the test pins in tests/dsh-settings-ui
  *  count every delay on this queue). */
-function probeOrigin(onOrigin: (origin: string) => void, onTheme?: (theme: "light" | "dark") => void): () => void {
+function probeOrigin(onOrigin: (origin: string) => void, onTheme?: (theme: "light" | "dark") => void, onTick?: (origin: string) => void): () => void {
     if (typeof fetch !== "function") return () => {};
     let cancelled = false;
     let settled = false;
@@ -210,6 +267,10 @@ function probeOrigin(onOrigin: (origin: string) => void, onTheme?: (theme: "ligh
                 if (typeof data.origin === "string" && data.origin.length > 0 && !cancelled) {
                     onOrigin(data.origin);
                     settled = true;
+                    // #3100: every resolution is also an embed-probe retry slot —
+                    // a snapshot-only origin (older hosts without the route)
+                    // never flows through onOrigin again after mount.
+                    if (onTick !== undefined) onTick(data.origin);
                 }
                 if (onTheme && !cancelled) {
                     const theme = detectHostTheme();
@@ -248,59 +309,95 @@ export function apply(ctx: ClientContext): void {
         // #2559: synchronous first paint — the very first render already pins
         // the palette to the host's current ground (no wrong-scheme flash).
         const [theme, setTheme] = useState<("light" | "dark") | undefined>(detectHostTheme);
+        // #3100: embed pre-flight verdict for the CURRENT origin — a verdict
+        // recorded for a previous origin (mid-session re-bind) is stale by
+        // definition and reads as "pending" until its own probe lands.
+        const [embed, setEmbed] = useState<EmbedState | undefined>(() => {
+            const o = readOrigin();
+            const v = o !== undefined ? embedVerdicts.get(o) : undefined;
+            return o !== undefined && v !== undefined ? { origin: o, verdict: v } : undefined;
+        });
         // #2288: no guard on the snapshot — the live route is authoritative
         // for the whole mount, so a stale boot value is corrected in place.
-        useEffect(() => probeOrigin(setOrigin, setTheme), []);
+        // #3100: each resolution also probes the new origin's embed route in
+        // flight, and every tick re-drives pending origins (snapshot-only
+        // hosts never resolve through this path again after mount).
+        useEffect(
+            () =>
+                probeOrigin(
+                    (o) => {
+                        setOrigin(o);
+                        probeEmbedRoute(o, setEmbed);
+                    },
+                    setTheme,
+                    (o) => probeEmbedRoute(o, setEmbed),
+                ),
+            [],
+        );
+        // #3100: mount-time probe for a snapshot origin and re-probe on any
+        // origin change (covers hosts whose live route never answers).
+        useEffect(() => {
+            if (origin !== undefined) probeEmbedRoute(origin, setEmbed);
+        }, [origin]);
+        const liveEmbed: EmbedVerdict | undefined = embed !== undefined && embed.origin === origin ? embed.verdict : undefined;
         const lang = t("nav") === zhDict.nav ? "zh" : "en";
+        let middle: unknown;
+        if (origin === undefined) {
+            middle = createElement("p", { style: { margin: 0, opacity: 0.7, lineHeight: 1.6 } }, t("degraded"));
+        } else if (liveEmbed === "stale") {
+            middle = createElement("p", { style: { margin: 0, opacity: 0.7, lineHeight: 1.6 } }, t("stale"));
+        } else if (liveEmbed === "ok") {
+            middle = createElement(
+                "div",
+                { style: { display: "flex", flexDirection: "column", gap: 10 } },
+                createElement(
+                    "div",
+                    { style: { display: "flex", gap: 8, flexWrap: "wrap" } },
+                    PAGE_IDS.map((id) =>
+                        createElement(
+                            "button",
+                            {
+                                key: id,
+                                type: "button",
+                                onClick: () => setPage(id),
+                                style: {
+                                    cursor: "pointer",
+                                    borderRadius: 8,
+                                    border: id === page ? "1px solid rgba(127,127,127,0.7)" : "1px solid rgba(127,127,127,0.4)",
+                                    background: id === page ? "rgba(127,127,127,0.12)" : "transparent",
+                                    color: "inherit",
+                                    fontFamily: "inherit",
+                                    fontSize: 13,
+                                    fontWeight: id === page ? 600 : 400,
+                                    lineHeight: "20px",
+                                    padding: "4px 14px",
+                                },
+                            },
+                            t(PAGE_KEYS[id]),
+                        ),
+                    ),
+                ),
+                createElement("iframe", {
+                    src: `${origin}/__bili/?embed=1&lang=${lang}${theme ? `&theme=${theme}` : ""}#/${page}`,
+                    title: t("title"),
+                    style: {
+                        display: "block",
+                        width: "100%",
+                        height: EMBED_HEIGHT,
+                        border: "1px solid rgba(127,127,127,0.4)",
+                        borderRadius: 8,
+                        background: "transparent",
+                    },
+                }),
+            );
+        } else {
+            middle = createElement("p", { style: { margin: 0, opacity: 0.7, lineHeight: 1.6 } }, t("connecting"));
+        }
         return createElement(
             "div",
             { style: { display: "flex", flexDirection: "column", gap: 12, padding: "20px 8px" } },
             titled ? createElement("h3", { style: { margin: 0, fontSize: 16, fontWeight: 600 } }, t("title")) : null,
-            origin === undefined
-                ? createElement("p", { style: { margin: 0, opacity: 0.7, lineHeight: 1.6 } }, t("degraded"))
-                : createElement(
-                    "div",
-                    { style: { display: "flex", flexDirection: "column", gap: 10 } },
-                    createElement(
-                        "div",
-                        { style: { display: "flex", gap: 8, flexWrap: "wrap" } },
-                        PAGE_IDS.map((id) =>
-                            createElement(
-                                "button",
-                                {
-                                    key: id,
-                                    type: "button",
-                                    onClick: () => setPage(id),
-                                    style: {
-                                        cursor: "pointer",
-                                        borderRadius: 8,
-                                        border: id === page ? "1px solid rgba(127,127,127,0.7)" : "1px solid rgba(127,127,127,0.4)",
-                                        background: id === page ? "rgba(127,127,127,0.12)" : "transparent",
-                                        color: "inherit",
-                                        fontFamily: "inherit",
-                                        fontSize: 13,
-                                        fontWeight: id === page ? 600 : 400,
-                                        lineHeight: "20px",
-                                        padding: "4px 14px",
-                                    },
-                                },
-                                t(PAGE_KEYS[id]),
-                            ),
-                        ),
-                    ),
-                    createElement("iframe", {
-                        src: `${origin}/__bili/?embed=1&lang=${lang}${theme ? `&theme=${theme}` : ""}#/${page}`,
-                        title: t("title"),
-                        style: {
-                            display: "block",
-                            width: "100%",
-                            height: EMBED_HEIGHT,
-                            border: "1px solid rgba(127,127,127,0.4)",
-                            borderRadius: 8,
-                            background: "transparent",
-                        },
-                    }),
-                ),
+            middle,
             createElement(
                 "div",
                 { style: { display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" } },

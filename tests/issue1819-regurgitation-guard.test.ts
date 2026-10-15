@@ -46,7 +46,7 @@ function startSummaryServer(replyText: string): Promise<Attempted> {
     return new Promise((resolve) => {
         server.once("listening", () => {
             const { port } = server.address() as { port: number };
-            resolve({ port, bodies, close: async () => { server.close(); await once(server, "close"); } });
+            resolve({ port, bodies, close: async () => { server.close(); server.closeIdleConnections?.(); await once(server, "close"); } });
         });
     });
 }

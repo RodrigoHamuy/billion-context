@@ -11,6 +11,8 @@ import {
     type CompressibleRange,
 } from "acp-kernel";
 import { conflictClientOf, conflictEventsOf, formatConflictSection } from "./conflict-watch.js";
+import { getOpenUpstreamCircuits } from "./upstream-alerts.js";
+import { dshLedgerFloorTokens } from "./server/budget.js";
 import { getBlindTunnelStats } from "./mitm.js";
 import { getUnrecognizedPathStats } from "./server/observability.js";
 import { ccrEnabled, ccrLoopConfig, contentStoreOf } from "./store.js";
@@ -31,6 +33,32 @@ interface AcpStatusCtx {
     session: Session;
 }
 
+// #3192: the submit gate rejects any range that still cites a ref recorded DEAD
+// (the client rewrote/dropped those messages), but the eligibility view
+// (buildCompressibleRanges) never reads state.deadRefs — so without this filter
+// the hint/acp_status advertise exactly the doomed ranges the gate then refuses,
+// contradicting the "recorded as DEAD" receipt in the same message. Drop any
+// advertised range whose [startRef..endRef] span contains a dead ref. No-op when
+// deadRefs is empty; conservative — drops the whole span rather than splitting
+// around the dead cell (the kernel-level split is the more fundamental home).
+export function excludeDeadRefRanges<T extends { startRef: string; endRef: string }>(ranges: T[], deadRefs?: string[]): T[] {
+    if (!deadRefs || deadRefs.length === 0) return ranges;
+    const deadNumbers: number[] = [];
+    for (const ref of deadRefs) {
+        const m = /^m(\d+)$/i.exec(ref);
+        if (m) deadNumbers.push(Number(m[1]));
+    }
+    if (deadNumbers.length === 0) return ranges;
+    return ranges.filter((range) => {
+        const s = /^m(\d+)$/i.exec(range.startRef);
+        const e = /^m(\d+)$/i.exec(range.endRef);
+        if (!s || !e) return true;
+        const start = Number(s[1]);
+        const end = Number(e[1]);
+        return !deadNumbers.some((n) => n >= start && n <= end);
+    });
+}
+
 export function liveCompressionRanges(ctx: AcpStatusCtx): { nudge: NudgeDecision; ranges: CompressibleRange[] } | undefined {
     const turn = ctx.core.processTurn({
         messages: ctx.messages,
@@ -44,7 +72,7 @@ export function liveCompressionRanges(ctx: AcpStatusCtx): { nudge: NudgeDecision
     const minChars = ctx.config.compress.minCompressRange;
     return {
         nudge: turn.nudge,
-        ranges: viableRanges(turn.nudge.compressibleRanges).filter((r) => minChars <= 0 || (r.chars ?? r.tokens * 4) >= minChars),
+        ranges: excludeDeadRefRanges(viableRanges(turn.nudge.compressibleRanges).filter((r) => minChars <= 0 || (r.chars ?? r.tokens * 4) >= minChars), ctx.session.state.deadRefs),
     };
 }
 
@@ -88,6 +116,35 @@ function formatDeadRefSpans(refs: string[]): string {
     }
     flush();
     return spans.length > 8 ? `${spans.slice(0, 8).join(", ")} (+${spans.length - 8} more)` : spans.join(", ");
+}
+
+// #3105: one history rewrite can archive hundreds of blocks sharing one reason
+// (#2695); an archived block can be neither compressed nor decompressed, so the
+// default aggregates by reason (constant size) and per-block ids are opt-in +
+// capped instead of listed verbatim (~20KB receipts before).
+const PRE_COMPACT_ARCHIVE_DETAIL_CAP = 50;
+
+function formatPreCompactionArchive(archive: Record<string, { at: number; reason: string }>, detail: boolean): string[] {
+    const ids = Object.keys(archive);
+    const lines: string[] = [
+        `PRE-COMPACTION ARCHIVE — ${ids.length} block(s): content left the session history (client native compaction or an unannounced history rewrite) and decompress is unavailable.`,
+    ];
+    if (detail) {
+        const shown = ids.slice(0, PRE_COMPACT_ARCHIVE_DETAIL_CAP);
+        for (const id of shown) lines.push(`  ${id} — ${archive[id]!.reason}`);
+        if (ids.length > shown.length) lines.push(`  (+${ids.length - shown.length} more; showing first ${shown.length} of ${ids.length})`);
+        return lines;
+    }
+    const byReason = new Map<string, number>();
+    for (const id of ids) {
+        const reason = archive[id]!.reason;
+        byReason.set(reason, (byReason.get(reason) ?? 0) + 1);
+    }
+    for (const [reason, count] of [...byReason.entries()].sort((a, b) => b[1] - a[1])) {
+        lines.push(`  ${count}: ${reason}`);
+    }
+    lines.push(`  per-block ids + reasons: acp_status({ archiveDetail: true })`);
+    return lines;
 }
 
 export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx): ProxyToolResult {
@@ -226,6 +283,30 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
             extra.push(`FOLD SUBSTRATE INVALID — last compress failure was attributed to ${lastCause}. The Compressible-ranges list above was re-derived from the current view; if folding a listed range fails again, start a fresh conversation — the folded base no longer matches what the client resends.`);
         }
     }
+    // #3148: upstream-failure state used to live only in bili.log — surface the
+    // circuit, the emergency-shrink baseline and the sticky planning-floor clamp
+    // here so hosts/models can see WHY rounds fail or output is capped.
+    // Display-only; none of this touches a wire decision.
+    const openCircuits = getOpenUpstreamCircuits();
+    if (openCircuits.length > 0) {
+        for (const c of openCircuits.slice(0, 4)) {
+            extra.push("");
+            extra.push(`UPSTREAM CIRCUIT OPEN — ${c.host}: ${c.consecutiveFailures} consecutive pre-response failures since ${c.openedAt !== null ? new Date(c.openedAt).toISOString() : "?"} · last failure ${c.lastFailure ? `${c.lastFailure.kind}${c.lastFailure.detail ? ` (${c.lastFailure.detail})` : ""} @ ${new Date(c.lastFailure.at).toISOString()}` : "?"}; next probe ${c.nextProbeAt !== null ? new Date(c.nextProbeAt).toISOString() : "soon"}. Requests to this host fail fast until the probe succeeds.`);
+        }
+        if (openCircuits.length > 4) extra.push(`UPSTREAM CIRCUIT OPEN — (+${openCircuits.length - 4} more host(s))`);
+    }
+    const shrinkAt = ctx.session.stats.emergencyShrinkAt;
+    if (typeof shrinkAt === "number") {
+        const ageMin = Math.max(0, Math.round((Date.now() - shrinkAt) / 60000));
+        extra.push("");
+        extra.push(`EMERGENCY SHRINK ARMED — baseline raised to local estimate ${ctx.session.stats.emergencyShrinkEstimate ?? "?"} tokens after a failed round with no usage report (${ageMin}m ago); truncation band active until the next real usage report.`);
+    }
+    const ledgerFloor = dshLedgerFloorTokens(ctx.session.metadata);
+    const lastClamp = ctx.session.stats.lastOutputClamp;
+    if (ledgerFloor > 0 || lastClamp !== undefined) {
+        extra.push("");
+        extra.push(`OUTPUT BUDGET CLAMP —${lastClamp !== undefined ? ` last: max_tokens ${lastClamp.raw} -> ${lastClamp.capped} (window ${lastClamp.window}, input~${Math.round(lastClamp.planningInput)}) @ ${new Date(lastClamp.at).toISOString()}` : ""} · planning floor ${ledgerFloor} tok from the refused dsh compaction replay (#2490, sticky for the session lifetime). Only compression can recover the input; this clamp guarantees native-window fit.`);
+    }
     // #1097: the processTurn above already resolved the envelope when armed
     // (contentStoreOf is idempotent); when disarmed skip the disk read.
     const ccrArmed = ccrEnabled(ctx.session);
@@ -271,13 +352,9 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
     extra.push("");
     extra.push(`STORAGE — ${storageStatusLabel()}`);
     const archive = preCompactionArchiveOf(ctx.session);
-    const archivedIds = Object.keys(archive);
-    if (archivedIds.length > 0) {
+    if (Object.keys(archive).length > 0) {
         extra.push("");
-        extra.push(`PRE-COMPACTION ARCHIVE — ${archivedIds.length} block(s): content was replaced by the client's native compaction summary, so it is no longer in the session history and decompress is unavailable.`);
-        for (const id of archivedIds) {
-            extra.push(`  ${id} — ${archive[id].reason}`);
-        }
+        extra.push(...formatPreCompactionArchive(archive, args.archiveDetail === true));
     }
     // #1206: conflict evidence (third-party compression plugin detected, or
     // runtime signs another compressor rewrote history) — visible here so the

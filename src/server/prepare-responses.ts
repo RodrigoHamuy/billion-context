@@ -6,8 +6,9 @@ import type { CompressReasoningConfig } from "../reasoning-drop.js";
 import { resolveAbsorbSettings } from "../compress-settings.js";
 import { resolveCompressProtocol, type CompressSettings, type ProxyOptions } from "../config.js";
 import { currentCalibrationFactor, strippedResponseIdWarning } from "../util.js";
-import { diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, repairResponsesAssistantOrdering, reapOrphansLogged, runNudgeDecision, stripKernelSummaries, usageGradeInputBaseline, warnResponsesReasoningPairs, withReasoningDrop, type Prepared } from "../server.js";
-import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, resolveDecisionRange, type DecideConfig } from "../nudge-decide.js";
+import { applyReasoningDrop, diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, planReasoningDrop, repairResponsesAssistantOrdering, reapOrphansLogged, runNudgeDecision, stripKernelSummaries, usageGradeInputBaseline, warnResponsesReasoningPairs, type Prepared } from "../server.js";
+import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, resolveDecisionRange, stripDecisionReasoningFields, type DecideConfig } from "../nudge-decide.js";
+import { excludeDeadRefRanges } from "../acp-status.js";
 import { mergeAdjacentConfigurationUpdates, patchResponsesInputWithToolImages as patchResponsesInput, responsesToCoreWithToolImages as responsesToCore } from "../responses-tool-output.js";
 import { dropWhitespaceResponsesMessages, normalizeResponsesMessageItems, sanitizeResponsesInputIds } from "../loop/adapter-responses.js";
 import { METADATA_LAST_RESPONSES_MODE, noteCanonicalSystemFingerprint, reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "../fold-reconcile.js";
@@ -27,7 +28,7 @@ import { estimateCoreMessages, estimateCoreMessagesUpper } from "../preflight.js
 import { hoistTrappedToolItems } from "../tool-pair-order.js";
 import { isStrictReasoningEcho, modelIdOf, normalizeStrictEchoResponsesInput } from "../strict-echo.js";
 import { reconcileSystemAnchor } from "../system-anchor.js";
-import { buildTriggerForgeBody, carriesCodexLocalCompactionSummary, codexCompactGate, codexCompactGatePre, codexCompactMode, hasCompactionTrigger, isCodexClient, mergeForgedSummaries, replaceBiliCompactionItems, stripBiliCompactionItems, CODEX_COMPACT_HEALTH_RATIO, CODEX_LOCAL_COMPACTION_MIN_MISSING } from "../codex-compact.js";
+import { buildPromptForgeBody, buildTriggerForgeBody, carriesCodexLocalCompactionSummary, codexCompactGate, codexCompactGatePre, codexCompactMode, hasCompactionPrompt, hasCompactionTrigger, isCodexClient, mergeForgedSummaries, replaceBiliCompactionItems, stripBiliCompactionItems, CODEX_COMPACT_HEALTH_RATIO, CODEX_LOCAL_COMPACTION_MIN_MISSING } from "../codex-compact.js";
 import type { ConversationIdentity } from "../session-id.js";
 import { logRawStripCounts, markerArtifactCount, stripRawStage } from "../marker/engine.js";
 import { keepResponseId as knobKeepResponseId, noCompressPrompt as knobNoCompressPrompt, noInjectTool as knobNoInjectTool, renderNone as knobRenderNone } from "../knobs.js";
@@ -56,7 +57,9 @@ export async function prepareResponses(
     const sessionId = session.id;
     const stream = parsed.stream === true;
     ++session.stats.requests;
-    const stripReasoning = (msgs: BiliMessage[]): BiliMessage[] => withReasoningDrop(msgs, reasoning, log, sessionId, isStrictReasoningEcho(session, upstreamOrigin, modelIdOf(parsed)));
+    // #3222: #651's reasoning-drop plan, computed on the INBOUND history before
+    // core.processTurn — see planReasoningDrop for why the post-turn view is too late.
+    let reasoningPlan = new Set<string>();
     if (reconcileNativeCompactionBoundary(session)) {
         log("info", `[${sessionId}] reconciled ACP state after native Responses compact boundary`);
     }
@@ -82,6 +85,7 @@ export async function prepareResponses(
     let processedMessages: CoreMessage[] = [];
     let originalMessages: CoreMessage[] = [];
     let nudge: NudgeDecision | undefined;
+    let nudgeOutcome: Prepared["nudgeOutcome"];
     let responsesProjection: ResponsesProjection | undefined;
     let rebuiltInput: ResponseInputItem[] | string = parsed.input;
     let toolsOut = parsed.tools;
@@ -264,6 +268,10 @@ export async function prepareResponses(
         const foldCoveredBefore = session.stats.pendingFoldUsage === true
             ? coveredRealHistoryIds(session.state.blocks)
             : null;
+        // #3222: BEFORE processTurn — its hide-compress-calls node removes
+        // inactive call+result pairs inside, which would strip the anchors
+        // this pass needs (the leak applies to the bare name too).
+        reasoningPlan = planReasoningDrop(msgs, reasoning, isStrictReasoningEcho(session, upstreamOrigin, modelIdOf(parsed)));
         const turn = core.processTurn({ messages: msgs, state: session.state, config: loopConfig, tokenCount, renderTags, contentStore: contentStoreOf(session) });
         session.state = turn.state;
         adoptContentStore(session, turn.contentStore);
@@ -281,7 +289,11 @@ export async function prepareResponses(
         // Drop sub-viability fragments before any consumer sees them: a tiny
         // range in the list makes batched compress attempts fail atomically
         // (kernel validates the whole batch). Mirrors billion-context-pi.
-        if (turn.nudge) turn.nudge.compressibleRanges = viableRanges(turn.nudge.compressibleRanges);
+        // #3204: also drop DEAD-ref-bracketing spans at this single point so
+        // every downstream consumer (decision prompt + directive, prose nudge,
+        // emergency override, preflight length gates) sees only spans the
+        // submit gate can accept — no surface advertises a doomed span.
+        if (turn.nudge) turn.nudge.compressibleRanges = excludeDeadRefRanges(viableRanges(turn.nudge.compressibleRanges), session.state.deadRefs);
         nudge = turn.nudge;
         session.stats.contextTokens = tokenCount;
         session.stats.contextTokensSource = tokenCountSource;
@@ -289,10 +301,19 @@ export async function prepareResponses(
             const t = deriveTitle(msgs);
             if (t) session.meta.title = t;
         }
-log("info", diagTagSummary(turn.messages, sessionId, renderTags));
-        const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && shouldInject && !isCompactionTrigger && !nudgeSuppressed(session) && !compressBreakerArmed(session) && !(autoFoldEngaged(loopConfig, session) && growthFoldingArmed(loopConfig, codexLane && codexCompactMode() === "intercept" ? loopConfig.modelContextLimit * CODEX_COMPACT_HEALTH_RATIO : undefined)) && (turn.nudge.shouldInject || emergencyNudge(turn.nudge, undefined, loopConfig.compress.minCompressRange));
-        log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model, willInjectNudge));
-        processedMessages = repairResponsesAssistantOrdering(stripReasoning(stripKernelSummaries(turn.messages, turn.state)), originalMessages);
+        log("info", diagTagSummary(turn.messages, sessionId, renderTags));
+        // #2155: a self-heal-suppressed session stops nagging. #3004: the decide
+        // ladder's fallback is the ONE exception — it is the failure-recovery path
+        // and must reach the model even while suppression is latched, or the two
+        // mechanisms dead-lock (suppression gates this flag, which gates the branch
+        // that breaks it; release waits on compression only a nudge could prompt).
+        // Self-limiting: consumeFallback resets on the same round, so at most one
+        // advisory punches through per 3 consecutive decision failures.
+        const decideTier1Arm = decide !== undefined && !!turn.nudge && turn.nudge.tier === 1 && turn.nudge.breakdown.emergencyOverride !== 1;
+        const decideFallbackOverride = decideTier1Arm && ladderMode(session.metadata) === "fallback";
+        const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && shouldInject && !isCompactionTrigger && (!nudgeSuppressed(session) || decideFallbackOverride) && !compressBreakerArmed(session) && !(autoFoldEngaged(loopConfig, session) && growthFoldingArmed(loopConfig, codexLane && codexCompactMode() === "intercept" ? loopConfig.modelContextLimit * CODEX_COMPACT_HEALTH_RATIO : undefined)) && (turn.nudge.shouldInject || emergencyNudge(turn.nudge, undefined, loopConfig.compress.minCompressRange));
+        log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model, willInjectNudge, decideTier1Arm && !decideFallbackOverride));
+        processedMessages = repairResponsesAssistantOrdering(applyReasoningDrop(stripKernelSummaries(turn.messages, turn.state), reasoningPlan, log, sessionId), originalMessages);
         reapOrphansLogged(session, msgs, log, sessionId);
         // [#1095] arrival-time image downscale (see prepareAnthropic).
         await applyImageCompressionPass(session, processedMessages as BiliMessage[], { config, billing: imageBillingFor(opts, billingUpstream ?? upstreamOrigin), cap: imageTokenCapFor(opts, billingUpstream ?? upstreamOrigin), log });
@@ -367,8 +388,12 @@ log("info", diagTagSummary(turn.messages, sessionId, renderTags));
                         inputItems.push({ type: "message", role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withFirstSightDrain(renderedWithPayload, turn.nudge.reason, externalSummaryEnabled(config)), externalSummaryEnabled(config)), visibilityMarkers) });
                         rebuiltInput = inputItems;
                         log("debug", `[${sessionId}] [inject] ephemeral nudge appended as trailing user turn (${rendered.text.length} chars)`);
+                        nudgeOutcome = "injected";
+                    } else {
+                        nudgeOutcome = "skipped";
                     }
                 } catch {
+                    nudgeOutcome = "skipped";
                 }
             } else if (useDecide) {
                 const ranges = turn.nudge.compressibleRanges ?? [];
@@ -378,6 +403,7 @@ log("info", diagTagSummary(turn.messages, sessionId, renderTags));
                     ? [{ type: "message", role: "user", content: rebuiltInput }]
                     : normalizeStrictEchoResponsesInput([...rebuiltInput], isStrictReasoningEcho(session, upstreamOrigin, modelIdOf(parsed)), log, sessionId);
                 const sideBody: Record<string, unknown> = { ...parsed, input: [...stableItems, { type: "message", role: "user", content: buildDecisionPrompt(ranges) }], tools: toolsOut, stream: false, max_output_tokens: decide.maxTokens };
+                stripDecisionReasoningFields("responses", sideBody);
                 const outcome = await runNudgeDecision({ req, opts, protocol: "responses", sideBody, session, log });
                 if (outcome.kind === "yes") {
                     const span = resolveDecisionRange(outcome, ranges);
@@ -388,9 +414,15 @@ log("info", diagTagSummary(turn.messages, sessionId, renderTags));
                         inputItems.push({ type: "message", role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withFirstSightDrain(buildDirectiveText(span.startRef, span.endRef, outcome.topic), turn.nudge.reason, externalSummaryEnabled(config)), externalSummaryEnabled(config)), visibilityMarkers) });
                         rebuiltInput = inputItems;
                         log("debug", `[${sessionId}] [inject] compress directive appended as trailing user turn`);
+                        nudgeOutcome = "injected";
                     } else {
+                        nudgeOutcome = "skipped";
                         log("info", `[${sessionId}] [acp-decide] yes but no live range left to target — skipping injection`);
                     }
+                } else {
+                    nudgeOutcome = "vetoed";
+                    // #3004: arm-level delivery truth (see the openai-lane note).
+                    log("info", `[${sessionId}] [acp-decide] tier-1 nudge arm not injected (${outcome.kind === "failed" ? `decision failed: ${outcome.detail}` : "model declined"}) — nothing sent this round`);
                 }
             } else {
                 try {
@@ -403,8 +435,12 @@ log("info", diagTagSummary(turn.messages, sessionId, renderTags));
                         inputItems.push({ type: "message", role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withFirstSightDrain(renderedWithPayload, turn.nudge.reason, externalSummaryEnabled(config)), externalSummaryEnabled(config)), visibilityMarkers) });
                         rebuiltInput = inputItems;
                         log("debug", `[${sessionId}] [inject] ephemeral nudge appended as trailing user turn (${rendered.text.length} chars)`);
+                        nudgeOutcome = "injected";
+                    } else {
+                        nudgeOutcome = "skipped";
                     }
                 } catch {
+                    nudgeOutcome = "skipped";
                 }
             }
         }
@@ -427,16 +463,24 @@ log("info", diagTagSummary(turn.messages, sessionId, renderTags));
         processedMessages = [];
     }
 
-    // E2 trigger form: codex's native remote-compaction request (final input item
-    // is compaction_trigger). When the kill-switch is on, the client is codex, and
-    // the safety gate passes, forge a success SSE (one compaction item +
-    // response.completed) and skip upstream — a deterministic handoff to the ACP
-    // state instead of a foreign compaction blob.
+    // E2 compaction forms: codex's native remote-compaction request (final
+    // input item is compaction_trigger) — and, since #3008, the LOCAL inline
+    // auto-compact that travels as an ordinary turn opening with codex's
+    // SUMMARIZATION_PROMPT template (prompt form). When the kill-switch is
+    // on, the client is codex, and the safety gate passes, forge a success
+    // reply and skip upstream — a deterministic handoff to the ACP state
+    // instead of a foreign compaction blob (the prompt form alone otherwise
+    // re-caches the full unfolded history, 720k tokens in the #3008 incident).
+    const compactForm: "trigger" | "prompt" | undefined = hasCompactionTrigger(parsed.input)
+        ? "trigger"
+        : hasCompactionPrompt(parsed.input)
+            ? "prompt"
+            : undefined;
     let codexForge: Prepared["codexForge"] | undefined;
     if (transformOk
+        && compactForm !== undefined
         && codexCompactMode() === "intercept"
         && isCodexClient(req.headers)
-        && hasCompactionTrigger(parsed.input)
         && codexCompactGate(session, config.modelContextLimit, transformOk)) {
         const summaries = session.state.blocks.filter((b) => b.active).map((b) => b.summary);
         const prevForged = session.metadata.codexForgedSummaries as string[] | undefined;
@@ -447,16 +491,20 @@ log("info", diagTagSummary(turn.messages, sessionId, renderTags));
         }
         // Codex recomputes its ledger from the next real request, but the
         // usage we mint here must not read as an empty context: fall back to
-        // estimating the trigger payload itself when lastInputTokens is
-        // stale/zero. The reply honors parsed.stream (JSON body when not
-        // streaming).
+        // estimating the payload itself when lastInputTokens is stale/zero.
+        // The reply honors parsed.stream (JSON body when not streaming).
         const est = defaultCountTokens(typeof parsed.input === "string" ? parsed.input : JSON.stringify(parsed.input ?? ""));
         const total = Math.max(session.stats.lastInputTokens, est, 1);
-        codexForge = {
-            kind: "trigger",
-            ...buildTriggerForgeBody(summaries.join("\n\n"), { inputTokens: total, outputTokens: 0, totalTokens: total }, stream),
-        };
-        log("info", `[${sessionId}] codex compact intercepted (trigger); forged SSE with ${summaries.length} block summary(s), upstream not contacted`);
+        codexForge = compactForm === "trigger"
+            ? {
+                kind: "trigger",
+                ...buildTriggerForgeBody(summaries.join("\n\n"), { inputTokens: total, outputTokens: 0, totalTokens: total }, stream),
+            }
+            : {
+                kind: "prompt",
+                ...buildPromptForgeBody(summaries.join("\n\n"), { inputTokens: total, outputTokens: 0, totalTokens: total }, stream),
+            };
+        log("info", `[${sessionId}] codex compact intercepted (${compactForm} form); forged ${stream ? "SSE" : "JSON"} with ${summaries.length} block summary(s), upstream not contacted`);
     }
 
     // #1479: Responses-wire twin of the #762 repair — fold + kernel round-trip
@@ -466,7 +514,7 @@ log("info", diagTagSummary(turn.messages, sessionId, renderTags));
     const rebuilt: ResponsesRequestBody = { ...parsed, input: rebuiltInput, tools: toolsOut };
     warnResponsesReasoningPairs(Array.isArray(rebuiltInput) ? rebuiltInput : [], log, sessionId);
     if (!isCompactionTrigger) {
-        clampOutgoingOutput(rebuilt as Record<string, unknown>, "max_output_tokens", { systemText: (responsesProjection?.systemParts ?? []).join("\n"), tools: toolsOut, processedMessages, lastInputTokens: session.stats.lastInputTokens, lastInputTokensSource: session.stats.lastInputTokensSource, nativeWindow, headroomWindow: config.modelContextLimit, imageTokens: imageReserveFor(session, "responses", rebuilt, opts, billingUpstream ?? upstreamOrigin), kFactor: currentCalibrationFactor(session.stats, session.metadata?.lastModel), kOrigin: session.stats.calibratedEstimateOrigin, origin: billingUpstream ?? upstreamOrigin, ledgerFloorTokens: dshLedgerFloorTokens(session.metadata) }, sessionId, log);
+        clampOutgoingOutput(rebuilt as Record<string, unknown>, "max_output_tokens", { systemText: (responsesProjection?.systemParts ?? []).join("\n"), tools: toolsOut, processedMessages, lastInputTokens: session.stats.lastInputTokens, lastInputTokensSource: session.stats.lastInputTokensSource, nativeWindow, headroomWindow: config.modelContextLimit, imageTokens: imageReserveFor(session, "responses", rebuilt, opts, billingUpstream ?? upstreamOrigin), kFactor: currentCalibrationFactor(session.stats, session.metadata?.lastModel), kOrigin: session.stats.calibratedEstimateOrigin, origin: billingUpstream ?? upstreamOrigin, ledgerFloorTokens: dshLedgerFloorTokens(session.metadata) }, sessionId, log, (c) => { session.stats.lastOutputClamp = { ...c, at: Date.now() }; });
     }
     // Route with the upstream THIS request goes to — session.meta.upstreamOrigin
     // is first-wins and would keep injecting pck toward a relay we switched
@@ -558,12 +606,13 @@ log("info", diagTagSummary(turn.messages, sessionId, renderTags));
         pluginMode,
         responsesTextProtocol,
         nudge,
+        nudgeOutcome,
         prompts,
         surface,
         renderTags,
         resetAfterSuccess: isCompactionTrigger,
         codexForge,
-        dropReasoning: stripReasoning,
+        dropReasoning: (msgs: BiliMessage[]) => applyReasoningDrop(msgs, reasoningPlan, log, sessionId),
     };
 }
 

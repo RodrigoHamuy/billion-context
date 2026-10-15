@@ -140,8 +140,10 @@ mitm: { enabled: false, domains: [] },
         assert.deepEqual(streamForwards, [true], "still exactly one forward total (no re-forwarding loop)");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });

@@ -263,8 +263,10 @@ async function withProxy(sessionId: string, streamBody: string, jsonBody: string
     } finally {
         setLogCapture(null);
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         relay.server.close();
+        relay.server.closeIdleConnections?.();
         await once(relay.server, "close");
     }
 }

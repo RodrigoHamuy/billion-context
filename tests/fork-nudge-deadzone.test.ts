@@ -120,7 +120,7 @@ async function harness() {
         const prefix = ordered.slice(0, messageCount);
         return request("/__bili/plugin/fork", { protocolVersion: 1, parentConversationId: parent, childConversationId: child, parentRevision: snapshot.body.parentRevision as string, branchPoint: { messageCount, orderHash: hash(prefix) }, orderedMessages: prefix, idempotencyKey: `fork-${child}` });
     };
-    return { request, seedParent, forkAt, dir, upstreamUrl, origin, close: async () => { store.cancelAll(); proxy.close(); upstream.close(); await Promise.all([once(proxy, "close"), once(upstream, "close")]); } };
+    return { request, seedParent, forkAt, dir, upstreamUrl, origin, close: async () => { store.cancelAll(); proxy.close(); proxy.closeIdleConnections?.(); upstream.close(); upstream.closeIdleConnections?.(); await Promise.all([once(proxy, "close"), once(upstream, "close")]); } };
 }
 
 test("mid-history fork seeds the nudge sizing baseline (dsh fork dead-zone repro)", async () => {
@@ -203,12 +203,27 @@ test("the child's first wire turn sizes on the seeded baseline, not 0 (lane proo
         const r = await fetch(`${h.origin}/bili/${h.upstreamUrl}/v1/messages`, { method: "POST", headers: { "content-type": "application/json", "x-bili-plugin": "test", "x-bili-plugin-conversation": "child" }, body: JSON.stringify({ model: "small-test", max_tokens: 1024, stream: false, messages }) });
         assert.equal(r.status, 200);
         await r.text();
-        const log = readFileSync(join(h.dir, "billion-context", "bili.log"), "utf8");
-        const childLines = log.split("\n").filter((l) => l.includes(child.id));
-        const nudgeLine = childLines.find((l) => l.includes("nudge"));
-        assert.ok(nudgeLine, "child turn must log its nudge decision");
+        // The logger's file leg is an async append stream (src/logger.ts) —
+        // under a loaded runner the HTTP response can return before the nudge
+        // line has flushed to disk, so a one-shot readFileSync raced the flush
+        // and false-red'd on Windows CI (#3147-A). Poll with a bounded
+        // deadline instead; the stream preserves write order, so once the
+        // nudge line is visible every earlier line of the same request (incl.
+        // any preflight warn) is visible too — the negative assertion below
+        // stays sound without a separate quiesce wait.
+        const logPath = join(h.dir, "billion-context", "bili.log");
+        const readLog = (): string => { try { return readFileSync(logPath, "utf8"); } catch { return ""; } };
+        const deadline = Date.now() + 5_000;
+        let nudgeLine: string | undefined;
+        for (;;) {
+            nudgeLine = readLog().split("\n").filter((l) => l.includes(child.id)).find((l) => l.includes("nudge"));
+            if (nudgeLine || Date.now() >= deadline) break;
+            await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+        assert.ok(nudgeLine, "child turn must log its nudge decision (waited up to 5s for the async log stream)");
         assert.doesNotMatch(nudgeLine, /usage=0% \(0\//, `dead-zone signature (usage 0% on 0 tokens) must be gone: ${nudgeLine}`);
         assert.match(nudgeLine, /(?:idle|ACTIVE)[^\n]*usage=[1-9]\d*%/);
+        const childLines = readLog().split("\n").filter((l) => l.includes(child.id));
         assert.doesNotMatch(childLines.join("\n"), /preflight compressing before forward/, "the in-band payload must not fall into the preflight path");
         t.diagnostic(`lane nudge line: ${nudgeLine?.trim()}`);
     } finally { await h.close(); }

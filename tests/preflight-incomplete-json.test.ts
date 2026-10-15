@@ -139,7 +139,7 @@ async function drive(proxyPort: number, upstreamPort: number, session: string, m
 }
 
 async function closeAll(...servers: http.Server[]): Promise<void> {
-    for (const s of servers) s.close();
+    for (const s of servers) { s.close(); s.closeIdleConnections?.(); }
     await Promise.allSettled(servers.map((s) => once(s, "close")));
 }
 

@@ -25,6 +25,7 @@
 import { loadOptions, ensureConfigTemplate } from "./config.js";
 import { startServer, restartForceCloseOf } from "./server.js";
 import { ensureSqliteEngine } from "./storage/engine-bootstrap.js";
+import { recordEngineBootstrap } from "./storage/runtime-status.js";
 import { configFile as defaultConfigFile } from "./paths.js";
 import { log as loggerLog } from "./logger.js";
 import { createAutoRestartHandler } from "./restart.js";
@@ -597,9 +598,10 @@ export async function main(): Promise<void> {
     // fetches when unified storage is requested AND no builtin/host engine
     // exists, so the common case costs nothing. Must complete before the first
     // session store opens (the store resolves its engine at construction).
-    await ensureSqliteEngine({
+    const bootstrapOutcome = await ensureSqliteEngine({
         resolveProxy: (url) => resolveProxy(opts.routes, opts.proxy, url, opts.proxyFallback),
     });
+    recordEngineBootstrap(bootstrapOutcome);
     const server = await startServer(opts);
 
     // Start background auto-update after the server is listening so a slow

@@ -5,7 +5,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
 import { defaultPrompts, type CompressionCore, type Config, type PackSurface, type Prompts } from "acp-kernel";
-import { conversationSignalAnthropic, conversationSignalGoogle, conversationSignalOpenai, conversationIdentityResponses, conversationSignalResponses, type AnthropicRequestBody, type GoogleRequestBody, type OpenAIRequestBody, type ResponsesRequestBody } from "acp-kernel/wire";
+import { conversationSignalAnthropic, conversationSignalGoogle, conversationSignalOpenai, conversationIdentityResponses, conversationSignalResponses, googleSystemText, type AnthropicRequestBody, type GoogleRequestBody, type OpenAIRequestBody, type ResponsesRequestBody } from "acp-kernel/wire";
 import { resolveCompress, resolveCompressPrompts, resolveCompressSurfaceDetailed, resolveRequestConfig } from "../compress-settings.js";
 import { FALLBACK_EFFECTIVE_WINDOW_FLOOR, findRoute, findRouteKey, lookupContextLimit, resolveConfiguredContextLimit, resolveConfiguredOutputLimit, resolveCompressProtocol, resolveDeclaredProtocol, type ProxyOptions } from "../config.js";
 import { resolveProxyDecision } from "../upstream-proxy.js";
@@ -15,8 +15,7 @@ import { DecodedRequestAdmission, DecodedRequestBusyError, MAX_DECODED_REQUEST_B
 import { hostIdForLog, maskHeadersForLog, maskUrlForLog, maskUrlsInText } from "../log-mask.js";
 import { bodyMightCarryImages, buildIncomingImageIndex, pruneRetrieveImgExports, refreshIncomingImageIndex, type IndexedImage } from "../image-restore.js";
 import { durableMessageToolPaths, withDurableProtection } from "../durable-message-guards.js";
-import { biliToolsDeclaredOnWire, countBiliToolUses, evaluateSelfHealRound, nudgeSuppressed, pluginLaneDegraded, pluginLaneRestore } from "../session-self-heal.js";
-import { compressBreakerArmed } from "../stream.js";
+import { biliToolsDeclaredOnWire, countBiliToolUses, evaluateSelfHealRound, pluginLaneDegraded, pluginLaneRestore } from "../session-self-heal.js";
 import { acquireInFlight, getSession, hasProcessedState, markDirty, peekSession, releaseInFlight, storeEffectiveConfig, tickPostRebuildAnchor, withSessionLock, type Session } from "../session.js";
 import { buildCompressSystemPrompt } from "../compress-tool.js";
 import { storeEffectiveImageCompression, type ImageCompressionSettings } from "../image-compress.js";
@@ -47,11 +46,11 @@ import { checkTunnelDestination, tunnelAllowlistFromEnv } from "../tunnel-guard.
 import { resolveCompatDropFields } from "../compat-drop.js";
 import { DecompressedTooLargeError, decodeRequestBody } from "../content-encoding.js";
 import { noInjectTool as knobNoInjectTool, rawDumpDir as knobRawDumpDir } from "../knobs.js";
+import { extractConversationId, isV1BackgroundSideRequest, isV1InternalRequest, unwrapV1Internal } from "../v1internal.js";
 import { anthropicBetaContextWindow, BILI_HOP_HEADER, capRegistryWindowByStandard, expandedContextSuffixWindow, launcherContextWindow, launcherMaxOutput, windowSourceLogged } from "./context-window.js";
 import { NO_IDENTITY_MESSAGE, safeSessionId } from "./headers.js";
 import { demoteGate, hasLeakedBiliToolsOnly, isDshTitleRequest, isServerToolUtilityCall, isSideRequest, resolveSideLane, restoreOutputBudget, sideRequestGuard, stripLeakedBiliTools } from "./side-request.js";
 import { DSH_COMPACTION_SHAPE_MSGS, detectPassthroughDshCompactionCall, dshCompactionRefusal, dshPassthroughGuardStats, isDshCompactionCall } from "./dsh-compaction-guard.js";
-import { emergencyNudge } from "./budget.js";
 import { artifactSeedHit, detectAcpArtifacts } from "./chain-artifacts.js";
 import { piSubagentChannelFallback } from "./pi-subagent-channel.js";
 import { FORCE_TEXT_PROTOCOL } from "./inject.js";
@@ -59,8 +58,9 @@ import { prepareAnthropic } from "./prepare-anthropic.js";
 import { prepareOpenai } from "./prepare-openai.js";
 import { prepareGoogle, prepareGoogleCountTokens } from "./prepare-google.js";
 import { prepareResponses, prepareResponsesCompact } from "./prepare-responses.js";
-import { bodyDumpEnabled, isModelDiscoveryPath, logDumpFailure, logUnrecognizedPath } from "./observability.js";
-import { handleAdminRoute } from "./admin.js";
+import { bodyDumpEnabled, isModelDiscoveryPath, isV1InternalControlPlanePath, logDumpFailure, logUnrecognizedPath } from "./observability.js";
+import { adminGateDenial, handleAdminRoute } from "./admin.js";
+import { handleIncrementalTurn, INCREMENTAL_TURN_PATH } from "../incremental-lane.js";
 import { ccrPluginWireOk, storeEffectiveCcr, type CcrSettings } from "../store.js";
 import { DEFAULT_DECIDE_MAX_TOKENS } from "../nudge-decide.js";
 import { BodyTooLargeError, forward, forwardUpstreamUrl, googleModelFromPath, googlePathKind, headroomEffectiveLogged, headroomFallbackLogged, headerValue, imageBillingFor, imageReserveFor, imageTokenCapFor, isCountTokensRequest, isPreflightFailFast, logRequestCost, NON_CONVERSATION_RELAY_WARN_CAP, nonConversationRelayWarned, prepareCountTokens, preflightCompressIfNeeded, readBody, resolveKnownOutputCeiling, resolveUpstream, resignSettingsFor, scrubAnthropicPck, scrubCompatDrop, warnRouteMissIfNew, type Prepared } from "../server.js";
@@ -84,6 +84,22 @@ export async function handle(
     const close = () => { if (!res.writableEnded) decodingAbort.abort(); };
     res.on("close", close);
     try {
+        // #3248 incremental lane: intercept BEFORE handleAdminRoute — the turn
+        // endpoint re-enters this same pipeline with a synthetic anthropic
+        // request, which requires module-local access to handleRequest. The
+        // /__bili/ security gate is applied explicitly here (same checks as
+        // handleAdminRoute, via adminGateDenial).
+        if (req.method === "POST" && (req.url ?? "").split("?", 2)[0] === INCREMENTAL_TURN_PATH) {
+            const denial = adminGateDenial(req, opts.host);
+            if (denial) {
+                res.writeHead(403, { "content-type": "application/json" });
+                res.end(JSON.stringify({ error: denial }));
+                return;
+            }
+            await handleIncrementalTurn(req, res, log, (syntheticReq, synRes) =>
+                handleRequest(syntheticReq, synRes, opts, core, config, log, instanceId, instanceStartedAt, proxyWatchers, initialWatcherPid, adminCtx, new DecodedRequestAdmission(), new AbortController().signal));
+            return;
+        }
         await handleRequest(req, res, opts, core, config, log, instanceId, instanceStartedAt, proxyWatchers, initialWatcherPid, adminCtx, admission, decodingAbort.signal);
     } finally {
         res.removeListener("close", close);
@@ -324,6 +340,27 @@ async function handleRequest(
             parsed = null;
         }
     }
+    // #3129: CloudCode/Antigravity v1internal dialect — unwrap the outer envelope
+    // so the pipeline sees a standard GoogleRequest, and decide identity. The
+    // inner request.sessionId is a constant FNV-1a hash, so identity comes from
+    // the stable Conversation ID in the system instruction instead. Background
+    // utility calls bypass the ACP state machine entirely (verbatim passthrough).
+    let v1Meta: Record<string, unknown> | undefined;
+    let v1Model: string | undefined;
+    let v1ConvId: string | undefined;
+    if (protocol === "google" && parsed !== null && isV1InternalRequest(urlPath, parsed)) {
+        const unwrapped = unwrapV1Internal(parsed as Record<string, unknown>);
+        parsed = unwrapped.inner;
+        v1Meta = unwrapped.meta;
+        v1Model = unwrapped.model ?? undefined;
+        v1ConvId = extractConversationId(unwrapped.inner) ?? undefined;
+        if (isV1BackgroundSideRequest(unwrapped.meta, unwrapped.inner)) {
+            log("info", `v1internal background utility call (requestType=${typeof unwrapped.meta.requestType === "string" ? unwrapped.meta.requestType : "micro"}) — verbatim passthrough, ACP state machine bypassed (#3129)`);
+            await forward(req, res, opts, scrubCompatDrop(scrubAnthropicPck(protocol, bodyBuffer, log), compatDropPaths, log), null, core, config, log, route, instanceId, undefined);
+            return;
+        }
+        log("debug", `v1internal envelope unwrapped (model=${v1Model ?? "?"} convId=${v1ConvId ?? "none"})`);
+    }
     // #2824: one cheap raw-text pass decides whether the incoming-image index
     //  (#1995/#2607) can find anything — a provably image-free body skips BOTH
     //  index builds (each one re-converts the full history wire→core). The
@@ -413,7 +450,9 @@ async function handleRequest(
     // The effective model for this request. Every wire carries it in the body
     // except Gemini, whose URL path holds it (`/v1beta/models/<model>:…`).
     const bodyModel = parsed && typeof parsed === "object" && "model" in parsed && typeof parsed.model === "string" ? parsed.model : undefined;
-    const requestModel = bodyModel ?? googleModel;
+    // #3129: v1internal carries the model in the OUTER envelope, not the path
+    // (/v1internal:* has no /models/<m>: segment) and not always the inner body.
+    const requestModel = bodyModel ?? googleModel ?? v1Model;
     // Capture the CLIENT's raw incoming request (before bili rebuilds) to
     // resolve whether codex sends previous_response_id + full input vs delta.
     if (opts.debug && parsed && typeof parsed === "object") {
@@ -733,11 +772,15 @@ async function handleRequest(
         const googleSignal = protocol === "google"
             ? conversationSignalGoogle(parsed as GoogleRequestBody, convHeader)
             : "";
+        // #3129: v1internal has no conversation header; its stable per-conversation
+        // UUID (from the system instruction) is treated as a client-provided id.
+        // Without this, every Antigravity window shares the anonymous branch and
+        // collides on the constant FNV-1a sessionId / empty-prefix affinity.
         const googleIdentity = protocol === "google"
             ? {
-                  value: googleSignal,
-                  source: convHeader ? ("header" as const) : ("content-fingerprint" as const),
-                  clientProvided: !!convHeader,
+                  value: v1ConvId ?? googleSignal,
+                  source: v1ConvId || convHeader ? ("header" as const) : ("content-fingerprint" as const),
+                  clientProvided: !!v1ConvId || !!convHeader,
               }
             : undefined;
         // #2156: a request that will ride the #388 side passthrough further
@@ -798,9 +841,30 @@ async function handleRequest(
             ? openaiSystemTextForPersona(parsed as OpenAIRequestBody)
             : protocol === "anthropic"
               ? systemTextsForSplit.join("\n\n")
-              : "";
+              : protocol === "google"
+                ? googleSystemText(parsed as GoogleRequestBody)
+                : "";
         const conversation = protocol === "google"
-            ? (googleIdentity?.value ?? googleSignal)
+            // #2730: the google lane is persona-aware too — dsh stamps its one
+            // conversation id on every wire including gemini (`x-bili-plugin: dsh`
+            // is wire-agnostic, dsh-native.ts; MODEL_API_SUFFIX routes google
+            // paths), so a review persona would otherwise merge into the main
+            // session exactly like #1916/#2203 did on the other wires. #3134:
+            // the same v2 order resolver as the other lanes since #3060 (fork
+            // keys are byte-compatible, so persisted fork lanes survive). An
+            // empty systemInstruction is non-anchoring (kernel anchor
+            // semantics): ride the verbatim id — never route empty-tag
+            // traffic through the order resolver.
+            ? (dshPersona && !sideRequestLike
+                ? (personaSystemText === ""
+                      ? (googleIdentity?.value ?? googleSignal)
+                      : personaConversationOrder(
+                          googleIdentity?.value ?? googleSignal,
+                          (parsed as GoogleRequestBody).contents,
+                          personaSystemText,
+                          pluginReportedModel(req.headers),
+                      ))
+                : (googleIdentity?.value ?? googleSignal))
             : protocol === "anthropic"
             ? // #970: a subagent's conversation value gets its own
               // `<id>|sub:<agent-id>` namespace so it lands on its own session
@@ -911,13 +975,18 @@ async function handleRequest(
             ? (openaiIdentity?.value ?? openaiSignal)
             : protocol === "anthropic"
               ? (anthropicIdentity?.value ?? anthropicSignal)
-              : protocol === "responses" && dshPersona
-                // #2203: dsh-responses forks record under their suffixed id
-                // (recordPluginSession keys on personaForked); without this
-                // case a fork would record under the raw id and steal the
-                // main session's entry from the single-valued conversations
-                // map (#970). Scoped to dsh: codexTurn keys verbatim and
-                // must keep personaForked false.
+              : protocol === "google" && dshPersona
+                // #2730: the google lane records its fork under the suffixed id
+                // too (same #970 discipline as openai/anthropic/responses above)
+                // so the conversations map keeps the raw key owned by the main
+                // session.
+                ? (googleIdentity?.value ?? googleSignal)
+                : protocol === "responses" && dshPersona
+                // #2203: the responses lane is persona-aware too — dsh's
+                // auto-review rides `instructions` under the same conversation id
+                // as its main turns, and the fork must record itself under its
+                // suffixed id so the single-valued conversations map keeps the raw
+                // key owned by the main session (#970 discipline).
                 ? (responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader))
                 : undefined;
         const personaForked = rawPersonaIdentity !== undefined && conversation !== rawPersonaIdentity;
@@ -926,10 +995,10 @@ async function handleRequest(
         // fork reviews, codex/claude-over-Responses instructions personas —
         // so the split-session canary can tell a DESIGNED split from the
         // #2165 drift shape (see splitSessionWarnings in src/session.ts).
-        // personaForked covers the anthropic/openai wires plus dsh-over-
-        // Responses (#2203); the explicit responses clause below stays for
-        // the codex/claude instructions personas (codexTurn keys verbatim
-        // and must not count).
+        // personaForked covers the anthropic/openai/google wires plus
+        // dsh-over-Responses (#2203/#2730); the explicit responses clause
+        // below stays for the codex/claude instructions personas (codexTurn
+        // keys verbatim and must not count).
         const designNamespaced = personaForked
             || (protocol === "responses"
                 && codexTurn === undefined
@@ -1970,6 +2039,20 @@ async function handleRequest(
                         session.incomingImageIndex = undefined;
                     }
                     const work = parsed;
+                    // #3211: pair this request's per-route k̂ calibration policy
+                    // (providers[<key>].calibration) onto the session so the NEXT
+                    // usage settle applies it at k̂ publication time — same
+                    // latest-wins, origin-gated pairing discipline as
+                    // lastLocalTextEstimate(+Origin). Resolved by the FULL
+                    // destination URL (mitm:// keys included, like every other
+                    // provider field); an absent policy stores undefined and
+                    // clears any stale slot from a previous route.
+                    {
+                        const destUrl = route ? route.rewrittenUrl : /^https?:\/\//i.test(urlPath) ? urlPath : `${opts.upstream}${urlPath}`;
+                        const calibPolicy = findRoute(opts.routes, destUrl)?.calibration;
+                        session.stats.lastCalibrationPolicy = calibPolicy;
+                        session.stats.lastCalibrationPolicyOrigin = calibPolicy ? destUrl : undefined;
+                    }
                     if (countTokens) {
                         return protocol === "google"
                             ? prepareGoogleCountTokens(work as GoogleRequestBody, core, reqConfig, log, session)
@@ -2042,18 +2125,28 @@ async function handleRequest(
                 // nudge-carrying prepared result (bypass lanes have nudge
                 // undefined and the hook no-ops inside). Side requests
                 // (title-gen etc.) never carry a nudge, so they cannot burn
-                // zombie credit either.
+                // zombie credit either. #3004: nudgeActive is the POST-GATE
+                // delivery fact (prepared.nudgeOutcome === "injected") — the
+                // pre-gate expression credited rounds whose nudge the decide
+                // gate later vetoed, arming suppress-nudge on a channel the
+                // model never received. Actual injection subsumes every factor
+                // the old expression listed: gated-off rounds (suppression /
+                // breaker / gate off / no arm) leave it undefined or yield
+                // "vetoed"/"skipped" — never "injected".
                 if (!selfHealRoundDone && prepared.nudge !== undefined) {
                     selfHealRoundDone = true;
                     evaluateSelfHealRound(session, {
                         pluginHeaderPresent: pluginAgentHeader(req.headers) !== undefined,
                         biliToolsDeclared: biliToolsDeclaredOnWire(parsed, protocol),
-                        nudgeActive: opts.compress.injectNudge && !nudgeSuppressed(session) && !compressBreakerArmed(session) && (prepared.nudge.shouldInject || emergencyNudge(prepared.nudge, undefined, config.compress.minCompressRange)),
+                        nudgeActive: prepared.nudgeOutcome === "injected",
                         biliToolUses: countBiliToolUses(prepared.processedMessages),
                         degradeAvailable: opts.compress.injectTool && !knobNoInjectTool(),
                     }, log);
                 }
-                if (!countTokens && !responsesCompact) {
+                // A locally-served codex compaction forge never reaches an
+                // upstream: preflight would burn summarization rounds for a
+                // reply that is already forged (#3008 prompt form).
+                if (!countTokens && !responsesCompact && !prepared.codexForge) {
                     const outcome = await preflightCompressIfNeeded(
                         prepared,
                         runPrepare,
@@ -2229,7 +2322,7 @@ async function handleRequest(
                           return next;
                       }
                     : undefined;
-                await forward(req, res, opts, pendingForward.body, pendingForward.prepared, core, reqConfig, log, route, instanceId, affinity, overflowRefold);
+                await forward(req, res, opts, pendingForward.body, pendingForward.prepared, core, reqConfig, log, route, instanceId, affinity, overflowRefold, v1Meta);
                 // Remember for ALL modes (not just plugin): wire clients (dsh,
                 // hermes, unplug'd pi) read the same panel via /__bili/plugin/status
                 // and need the nudge/breakdown sections too; locked so a racing
@@ -2244,7 +2337,7 @@ async function handleRequest(
         }
     }
     if (!prepared && !forwarded) {
-        if (protocol === null && !opts.passthrough && !routePassthrough && !isModelDiscoveryPath(urlPath)) {
+        if (protocol === null && !opts.passthrough && !routePassthrough && !isModelDiscoveryPath(urlPath) && !isV1InternalControlPlanePath(urlPath)) {
             logUnrecognizedPath(log, req.url ?? "");
         }
         await forward(req, res, opts, scrubCompatDrop(scrubAnthropicPck(protocol, bodyBuffer, log), compatDropPaths, log), null, core, reqConfig, log, route, instanceId, undefined);

@@ -300,7 +300,9 @@ async function startHarness(): Promise<Harness> {
         upstreamPort,
         close: async () => {
             proxy.close();
+            proxy.closeIdleConnections?.();
             upstream.close();
+            upstream.closeIdleConnections?.();
             await Promise.allSettled([once(proxy, "close"), once(upstream, "close")]);
             if (prevStateHome === undefined) delete process.env.XDG_STATE_HOME;
             else process.env.XDG_STATE_HOME = prevStateHome;

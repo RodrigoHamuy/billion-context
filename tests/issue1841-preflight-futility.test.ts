@@ -122,8 +122,10 @@ async function boot(): Promise<{ proxyPort: number; upstreamPort: number; cleanu
         upstreamPort,
         cleanup: async () => {
             proxy.close();
+            proxy.closeIdleConnections?.();
             await once(proxy, "close");
             upstream.close();
+            upstream.closeIdleConnections?.();
             await once(upstream, "close");
         },
     };

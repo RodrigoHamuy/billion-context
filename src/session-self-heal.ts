@@ -47,6 +47,20 @@ import type { Session } from "./session.js";
  * (#2155: no new config knobs); recorded in TECHNICAL-NOTES.md. */
 export const SELF_HEAL_WINDOW = 5;
 
+/** #3004: wall-clock cap on the suppress-nudge remedy. Release is
+ * evidence-based (a reduction or bili tool use lifts it), but when the agent
+ * never compresses on its own that evidence never arrives and the latch was
+ * permanent — while the ONLY channel left to prompt compression IS the
+ * suppressed nudge (circular wait; field report: 4h12m latch at zero blocks,
+ * context pinned 77% under the wall). After the cap the remedy clears and
+ * re-evaluates from scratch: still-idle sessions re-arm after another
+ * SELF_HEAL_WINDOW injected rounds, so noise stays bounded (at most one
+ * window of nudges per cap period) and sessions that start compressing
+ * recover on evidence exactly as before. Constant by design (#2155
+ * precedent); does not apply to degrade-to-proxy (its recovery is
+ * header-driven, not circular). */
+export const SELF_HEAL_SUPPRESS_CAP_MS = 10 * 60 * 1000;
+
 type SelfHealAction = "degrade-to-proxy" | "suppress-nudge";
 
 type SelfHealStateView = { detected: string; action: string; since: number };
@@ -150,9 +164,18 @@ export function evaluateSelfHealRound(session: Session, inputs: SelfHealRoundInp
     st.lastReductionKey = key;
 
     const active = selfHealOf(session);
+    // #3004: time cap BEFORE evidence recovery — a suppression older than the
+    // cap clears unconditionally so the nudge channel gets a fresh chance even
+    // when no compression evidence ever arrives (the circular-wait case).
+    if (active !== undefined && active.action === "suppress-nudge" && Date.now() - active.since >= SELF_HEAL_SUPPRESS_CAP_MS) {
+        clearSelfHeal(session);
+        st.zombieStreak = 0;
+        st.idleStreak = 0;
+        log("info", `[${session.id}] [self-heal] nudge suppression expired after ${Math.round((Date.now() - active.since) / 60_000)} min without compression evidence — re-enabling the nudge channel (re-arms after ${SELF_HEAL_WINDOW} more idle rounds if still ignored) (#3004)`);
+    }
     // Recovery: evidence first, detection second — a recovered session can
     // re-arm later if it goes idle again (streaks restart from this round).
-    if (active !== undefined) {
+    if (active !== undefined && selfHealOf(session) !== undefined) {
         if (active.action === "degrade-to-proxy" && inputs.pluginHeaderPresent) {
             // NOTE: biliToolsDeclared is deliberately NOT a recovery signal
             // here — after degrading, OUR OWN wire injection puts the ACP tools

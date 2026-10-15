@@ -175,6 +175,7 @@ test("family gate: no raw negative string slices outside the allowlist", () => {
     const allowlist = new Map<string, RegExp[]>([
         ["src/conflict-watch.ts", [/events\.slice\(-10\)/]], // array receiver
         ["src/web/client.ts", [/conflicts\.slice\(-10\)/]], // array receiver (#2102 session-detail card)
+        ["src/web/report.ts", [/lines\.slice\(-12\)/, /folds\.slice\(-15\)/]], // array receiver (#3099 session-report tables)
         ["src/text-safe.ts", [/\.slice\(/]], // the clamped implementation itself
     ]);
     const srcDir = path.join(import.meta.dirname, "..", "src");

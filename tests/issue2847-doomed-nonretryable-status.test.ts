@@ -126,7 +126,9 @@ async function setup(): Promise<{ ctx: Ctx; calls: Call[]; close: () => Promise<
         calls,
         close: async () => {
             proxy.close();
+            proxy.closeIdleConnections?.();
             upstream.close();
+            upstream.closeIdleConnections?.();
             await Promise.allSettled([once(proxy, "close"), once(upstream, "close")]);
         },
     };

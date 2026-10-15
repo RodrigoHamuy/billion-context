@@ -118,7 +118,7 @@ async function driveChatPreflight(proxyPort: number, upstreamPort: number, sessi
 }
 
 async function closeAll(...servers: http.Server[]): Promise<void> {
-    for (const s of servers) s.close();
+    for (const s of servers) { s.close(); s.closeIdleConnections?.(); }
     await Promise.allSettled(servers.map((s) => once(s, "close")));
 }
 

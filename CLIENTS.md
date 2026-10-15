@@ -245,11 +245,14 @@ pure-stdlib Python module shipped inside the npm package:
 - **Plugin-mode stamping:** an `llm_request` middleware stamps
   `x-bili-plugin: hermes` + conversation id (= the hermes session id, so
   gateway multi-session stays safe) + model, and `x-bili-plugin-max-output`
-  once known — ONLY after the ACP tools are registered against the live proxy
-  manifest; round 1 rides wire mode. A `pre_api_request` hook captures the
-  effective `max_tokens` and pushes runtime-info (model + max output) to the
-  proxy. `compress` / `decompress` / `acp_status` are registered as real
-  hermes tools served by the proxy's existing plugin endpoints.
+  once known — plus `x-bili-plugin-context-window` when the host's own
+  per-model window is known (read from `HERMES_HOME/context_length_cache.yaml`,
+  keyed `<model>@<base_url>`; ambiguous entries are never guessed, #3261) —
+  ONLY after the ACP tools are registered against the live proxy manifest;
+  round 1 rides wire mode. A `pre_api_request` hook captures the effective
+  `max_tokens` and pushes runtime-info (model + max output + context window)
+  to the proxy. `compress` / `decompress` / `acp_status` are registered as
+  real hermes tools served by the proxy's existing plugin endpoints.
 - **Known limitations:** requests going out hermes' Codex-wire transport may
   drop the per-request header surface, so such setups stay in wire mode until
   that transport exposes headers. Inert when `BILLION_CONTEXT_PROXY` is set

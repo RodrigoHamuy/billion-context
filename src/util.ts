@@ -491,3 +491,51 @@ export function appendSystemText(
 export function shouldReserveOutputHeadroom(protocol: string | undefined): boolean {
     return protocol !== "anthropic";
 }
+
+/** System-carrier texts of a parsed request body, covering all four wire shapes:
+ *  anthropic/openai-hoisted top-level `system` (string or text-block array),
+ *  responses `instructions`, google `systemInstruction.parts`, and system/developer
+ *  entries kept inside `messages[]`/`input[]` by raw clients (identical carrier
+ *  list to estimateWireOverhead, src/server/budget.ts). */
+export function systemCarrierTexts(parsed: Record<string, unknown>): string[] {
+    const out: string[] = [];
+    const sys = parsed.system;
+    if (typeof sys === "string") out.push(sys);
+    else if (Array.isArray(sys)) pushBlockTexts(out, sys);
+    const inst = parsed.instructions;
+    if (typeof inst === "string") out.push(inst);
+    const si = parsed.systemInstruction;
+    if (typeof si === "object" && si !== null) {
+        const parts = (si as Record<string, unknown>).parts;
+        if (Array.isArray(parts)) pushBlockTexts(out, parts);
+    }
+    for (const key of ["messages", "input"]) {
+        const arr = parsed[key];
+        if (!Array.isArray(arr)) continue;
+        for (const entry of arr) {
+            if (typeof entry !== "object" || entry === null) continue;
+            const rec = entry as Record<string, unknown>;
+            if (rec.role !== "system" && rec.role !== "developer") continue;
+            const c = rec.content;
+            if (typeof c === "string") out.push(c);
+            else if (Array.isArray(c)) pushBlockTexts(out, c);
+        }
+    }
+    return out;
+}
+
+function pushBlockTexts(out: string[], blocks: unknown[]): void {
+    for (const b of blocks) {
+        const t = blockText(b);
+        if (t !== undefined) out.push(t);
+    }
+}
+
+function blockText(v: unknown): string | undefined {
+    if (typeof v === "string") return v;
+    if (typeof v === "object" && v !== null) {
+        const t = (v as Record<string, unknown>).text;
+        if (typeof t === "string") return t;
+    }
+    return undefined;
+}

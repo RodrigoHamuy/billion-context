@@ -229,8 +229,11 @@ test("#2317 e2e: a route-miss is loud in the log and a route-hit shows the match
     } finally {
         setLogCapture(null);
         h.proxy.close();
+        h.proxy.closeIdleConnections?.();
         h.upA.close();
+        h.upA.closeIdleConnections?.();
         h.upB.close();
+        h.upB.closeIdleConnections?.();
         await Promise.allSettled([once(h.proxy, "close"), once(h.upA, "close"), once(h.upB, "close")]);
     }
 });

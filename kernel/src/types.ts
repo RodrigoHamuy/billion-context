@@ -388,6 +388,15 @@ export interface Config {
   compress: CompressValidationConfig;
   protectedTools: string[];
   isToolProtected?: (toolName: string, toolInputText?: string) => boolean;
+  /** Host-declared set of tool NAMES that count as a `compress` call for the
+   *  consumed-call lifecycle pass (hideConsumedCompressCalls). The kernel
+   *  hardcodes only the canonical bare name ("compress"); hosts that expose
+   *  compression under a dialect name (e.g. MCP's "mcp__bili__compress")
+   *  inject a predicate recognizing both so those calls get the SAME inactive
+   *  cleanup + live-range arg reduction as the bare form instead of bypassing
+   *  it (billion-context#2970). Unset = bare-name only (byte-identical to
+   *  before). Must be pure and cheap: runs once per message per pass. */
+  isCompressTool?: (toolName: string) => boolean;
   /** Host-declared message-level hard protection (billion-context#2419):
    *  when set, ANY message for which the predicate returns true is excluded
    *  from compression exactly like a protectedTools hit — BLOCKED ref in

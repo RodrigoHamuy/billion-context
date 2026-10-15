@@ -278,65 +278,78 @@ function collectButtons(node: unknown, out: ElementNode[] = []): ElementNode[] {
     return out;
 }
 
-test("#1590/#2125: client bundle registers the settings.section entry bili AND the plugins.bundle.config panel (wrapper id, require purity, both render branches)", async () => {
-    const { build } = await import("esbuild");
-    // Reuse tsup.config.ts as the single source of truth for the wrapper
-    // banner/footer and externals so the test cannot drift from the shipped
-    // bundle shape.
-    const configs = ((await import("../tsup.config.ts")).default) as unknown as Array<{
-        entry: Record<string, string>;
-        platform: string;
-        target: string;
-        external?: string[];
-        banner?: { js?: string };
-        footer?: { js?: string };
-    }>;
-    const cfg = configs.find((c) => c.entry["agent/dsh-native-client"] !== undefined);
-    assert.ok(cfg !== undefined, "tsup config must keep the dsh client entry");
-    const result = await build({
-        entryPoints: [cfg.entry["agent/dsh-native-client"]],
-        bundle: true,
-        format: "cjs",
-        platform: cfg.platform as Parameters<typeof build>[0]["platform"],
-        target: cfg.target,
-        external: cfg.external,
-        banner: cfg.banner,
-        footer: cfg.footer,
-        write: false,
-    });
-    assert.equal(result.outputFiles!.length, 1);
-    const code = result.outputFiles![0].text;
+// One esbuild pass per test file — every scenario below runs the SAME shipped
+// wrapper shape (banner/footer/externals sourced from tsup.config.ts).
+let clientCodePromise: Promise<string> | undefined;
+async function clientCode(): Promise<string> {
+    clientCodePromise ??= (async () => {
+        const { build } = await import("esbuild");
+        const configs = ((await import("../tsup.config.ts")).default) as unknown as Array<{
+            entry: Record<string, string>;
+            platform: string;
+            target: string;
+            external?: string[];
+            banner?: { js?: string };
+            footer?: { js?: string };
+        }>;
+        const cfg = configs.find((c) => c.entry["agent/dsh-native-client"] !== undefined);
+        assert.ok(cfg !== undefined, "tsup config must keep the dsh client entry");
+        const result = await build({
+            entryPoints: [cfg.entry["agent/dsh-native-client"]],
+            bundle: true,
+            format: "cjs",
+            platform: cfg.platform as Parameters<typeof build>[0]["platform"],
+            target: cfg.target,
+            external: cfg.external,
+            banner: cfg.banner,
+            footer: cfg.footer,
+            write: false,
+        });
+        assert.equal(result.outputFiles!.length, 1);
+        return result.outputFiles![0].text;
+    })();
+    return clientCodePromise;
+}
 
+const tick = (): Promise<void> => new Promise<void>((r) => setTimeout(r, 0));
+
+// #3100: what a CURRENT server answers for the exact framed URL — a 200 with
+// an HTML content type (older builds answer the query form with a JSON 404).
+const htmlOk = () => ({ ok: true, headers: { get: (_k: string) => "text/html; charset=utf-8" } });
+
+type Face = { inject: string[]; apply: (ctx: unknown) => void };
+
+type Mounted = {
+    component: () => unknown;
+    resetHooks: () => void;
+    runCleanups: () => void;
+    inject: string[];
+    slotsOrder: string[];
+    optionsBySlot: Map<string, Record<string, unknown>>;
+    dicts: Record<string, { zh: Record<string, string>; en: Record<string, string> }>;
+};
+
+// Mounts the client bundle in a fresh vm realm (one page load) with the given
+// globals. React hooks are emulated with per-mount state: useState persists
+// across renders, useEffect follows React semantics (#2288) — run on mount,
+// re-run only when their deps change (prior cleanup first).
+async function mountClient(extra: Record<string, unknown>, slotName = "settings.section"): Promise<Mounted> {
+    const code = await clientCode();
     const registrations: Array<{ id: string; factory: (require: (spec: string) => unknown) => unknown }> = [];
     const sandbox: Record<string, unknown> = {};
     sandbox.window = { __ModuleLoader__: { load: (reg: (typeof registrations)[number]) => registrations.push(reg) } };
+    Object.assign(sandbox, extra);
     vm.createContext(sandbox);
     vm.runInContext(code, sandbox, { filename: "dsh-native-client.bundle.js" });
     assert.equal(registrations.length, 1);
     // Must equal the loader entry name the scanner keys its graph row by.
     assert.equal(registrations[0].id, "billion-context");
-
-    const calls: ElementNode[] = [];
-    // Minimal hook emulation (#1809): per-mount state persisting across
-    // component() re-renders; effects follow React semantics (#2288) — run on
-    // mount, re-run only when their deps change (prior cleanup first). The old
-    // run-on-every-render stub masked the removed snapshot guard by silently
-    // starting duplicate probes on each re-render.
     type EffectSlot = { deps: readonly unknown[] | undefined; cleanup: (() => void) | undefined };
     let hookStates: unknown[] = [];
     let hookIndex = 0;
     let effectSlots: EffectSlot[] = [];
-    const resetHooks = (): void => {
-        hookStates = [];
-        hookIndex = 0;
-        effectSlots = [];
-    };
     const reactStub = {
-        createElement: (type: string, props: Record<string, unknown> | null, ...children: unknown[]): ElementNode => {
-            const el = { type, props, children };
-            calls.push(el);
-            return el;
-        },
+        createElement: (type: string, props: Record<string, unknown> | null, ...children: unknown[]): ElementNode => ({ type, props, children }),
         useState: (init: unknown): [unknown, (v: unknown) => void] => {
             const i = hookIndex++;
             if (!(i in hookStates)) hookStates[i] = typeof init === "function" ? (init as () => unknown)() : init;
@@ -358,67 +371,101 @@ test("#1590/#2125: client bundle registers the settings.section entry bili AND t
         if (spec === "react") return reactStub;
         throw new Error(`unexpected external require: ${spec}`);
     };
-    const face = registrations[0].factory(requireStub) as { inject: string[]; apply: (ctx: unknown) => void };
+    const face = registrations[0].factory(requireStub) as Face;
     // Re-materialize in the host realm: vm-context arrays carry the sandbox's
     // Array.prototype, which deepStrictEqual rejects.
-    assert.deepEqual(Array.from(face.inject), ["slots", "locale"]);
+    const inject = Array.from(face.inject);
     assert.equal(typeof face.apply, "function");
+    const dicts: Record<string, { zh: Record<string, string>; en: Record<string, string> }> = {};
+    const slotsOrder: string[] = [];
+    const optionsBySlot = new Map<string, Record<string, unknown>>();
+    const components = new Map<string, () => unknown>();
+    let current: string | undefined;
+    face.apply({
+        effect: (fn: () => void) => fn(),
+        locale: {
+            register: (ns: string, dict: { zh: Record<string, string>; en: Record<string, string> }) => {
+                dicts[ns] = dict;
+            },
+            bind: (ns: string) => (key: string) => dicts[ns]?.zh?.[key] ?? key,
+        },
+        slots: {
+            inject: (name: string, p: () => void) => {
+                slotsOrder.push(name);
+                current = name;
+                p();
+            },
+            register: (opts: Record<string, unknown>, comp: () => unknown) => {
+                optionsBySlot.set(current!, opts);
+                components.set(current!, comp);
+            },
+        },
+    });
+    assert.ok(components.has(slotName), `slot ${slotName} must be registered`);
+    const bound = components.get(slotName)!;
+    return {
+        // Hook indices restart on every render (React matches hooks by
+        // position within a single render).
+        component: (): unknown => { hookIndex = 0; return bound(); },
+        resetHooks: () => {
+            hookStates = [];
+            hookIndex = 0;
+            effectSlots = [];
+        },
+        runCleanups: () => {
+            // Positions held by non-effect hooks (useState) stay as holes.
+            for (const slot of effectSlots.splice(0)) slot?.cleanup?.();
+        },
+        inject,
+        slotsOrder,
+        optionsBySlot,
+        dicts,
+    };
+}
 
-    type Entry = { options: Record<string, unknown>; component: () => unknown };
-    const runApply = (): { slots: string[]; bySlot: Map<string, Entry>; zh: Record<string, string>; en: Record<string, string> } => {
-        const effects: Array<() => void> = [];
-        const dicts: Record<string, { zh: Record<string, string>; en: Record<string, string> }> = {};
-        const slots: string[] = [];
-        const bySlot = new Map<string, Entry>();
-        let current: string | undefined;
-        face.apply({
-            effect: (fn: () => void, _label?: string) => effects.push(fn),
-            locale: {
-                register: (ns: string, dict: { zh: Record<string, string>; en: Record<string, string> }) => {
-                    dicts[ns] = dict;
-                },
-                bind: (ns: string) => (key: string) => dicts[ns]?.zh?.[key] ?? key,
-            },
-            slots: {
-                inject: (name: string, p: () => void) => {
-                    slots.push(name);
-                    current = name;
-                    p();
-                },
-                register: (opts: Record<string, unknown>, comp: () => unknown) => {
-                    // Hook indices restart on every render (React matches hooks
-                    // by position within a single render), so wrap the entry.
-                    bySlot.set(current!, { options: opts, component: (): unknown => { hookIndex = 0; return comp(); } });
-                },
-            },
-        });
-        for (const eff of effects) eff();
-        assert.deepEqual(slots, ["settings.section", "plugins.bundle.config"]);
-        assert.equal(bySlot.size, 2);
-        assert.ok(dicts["bili"] !== undefined);
-        return { slots, bySlot, zh: dicts["bili"].zh, en: dicts["bili"].en };
+test("#1590/#2125: client bundle registers the settings.section entry bili AND the plugins.bundle.config panel (wrapper id, require purity, both render branches)", async () => {
+    const opened: string[] = [];
+    const extra: Record<string, unknown> = {
+        __BILI__: { origin: "http://127.0.0.1:8787" },
+        open: (url: string) => opened.push(url),
+        // #3100: the embed pre-flight answers HTML here — every build since
+        // v0.1.189 serves the query-form UI route.
+        fetch: async (url: string) => {
+            if (String(url).endsWith("/__bili/?embed=1")) return { ok: true, headers: { get: (_k: string) => "text/html; charset=utf-8" } };
+            return { ok: true, json: async () => ({ origin: "http://127.0.0.1:8787" }) };
+        },
+        // The poll loop schedules its retry through the injected clock — the
+        // vm realm has no host globals of its own.
+        setTimeout,
+        clearTimeout,
     };
 
-    sandbox.__BILI__ = { origin: "http://127.0.0.1:8787" };
-    const withOrigin = runApply();
-    const settings = withOrigin.bySlot.get("settings.section")!;
-    assert.equal(settings.options.name, "settings.section");
-    assert.equal(settings.options.id, "bili");
-    assert.equal(settings.options.order, 100);
-    assert.equal(settings.options.locale, "bili");
-    assert.equal(typeof settings.options.label, "function");
-    assert.equal((settings.options.label as () => string)(), "bili设置");
-    const bundle = withOrigin.bySlot.get("plugins.bundle.config")!;
-    assert.equal(bundle.options.name, "plugins.bundle.config");
-    assert.equal(bundle.options.key, "billion-context");
-    assert.equal(bundle.options.locale, "bili");
+    const m = await mountClient(extra);
+    assert.deepEqual(Array.from(m.inject), ["slots", "locale"]);
+    assert.deepEqual(m.slotsOrder, ["settings.section", "plugins.bundle.config"]);
+    assert.equal(m.optionsBySlot.size, 2);
+    assert.ok(m.dicts["bili"] !== undefined);
+    const settings = m.optionsBySlot.get("settings.section")!;
+    assert.equal(settings.name, "settings.section");
+    assert.equal(settings.id, "bili");
+    assert.equal(settings.order, 100);
+    assert.equal(settings.locale, "bili");
+    assert.equal(typeof settings.label, "function");
+    assert.equal((settings.label as () => string)(), "bili设置");
+    const bundle = m.optionsBySlot.get("plugins.bundle.config")!;
+    assert.equal(bundle.name, "plugins.bundle.config");
+    assert.equal(bundle.key, "billion-context");
+    assert.equal(bundle.locale, "bili");
     // Keyed slot: the host matches the key against its own package name — no
     // list-slot fields may ride along.
-    assert.deepEqual(Object.keys(bundle.options).sort(), ["key", "locale", "name"]);
-    assert.deepEqual(Object.keys(withOrigin.zh).sort(), Object.keys(withOrigin.en).sort());
-    calls.length = 0;
-    resetHooks();
-    const tree = settings.component() as ElementNode;
+    assert.deepEqual(Object.keys(bundle).sort(), ["key", "locale", "name"]);
+    assert.deepEqual(Object.keys(m.dicts["bili"].zh).sort(), Object.keys(m.dicts["bili"].en).sort());
+
+    m.resetHooks();
+    const pendingTree = m.component() as ElementNode;
+    assert.equal(findTag(pendingTree, "iframe"), undefined, "#3100: the frame waits for the embed pre-flight verdict");
+    await tick();
+    const tree = m.component() as ElementNode;
     assert.equal(tree.type, "div");
     assert.notEqual(findTag(tree, "h3"), undefined, "the settings section keeps its own title");
     // #2321: bound state embeds the real web UI — tab bar plus one iframe at
@@ -450,21 +497,23 @@ test("#1590/#2125: client bundle registers the settings.section entry bili AND t
     assert.deepEqual(tabLabels, ["总览", "会话", "配置", "日志"], "tabs mirror the web UI nav terminology");
     // Tab click moves only the hash — the frame navigates same-document.
     (buttons[1].props!.onClick as () => void)();
-    const treeAfterTab = settings.component() as ElementNode;
+    const treeAfterTab = m.component() as ElementNode;
     const frameAfterTab = findTag(treeAfterTab, "iframe");
     assert.ok(frameAfterTab !== undefined);
     assert.equal(frameAfterTab.props?.src, "http://127.0.0.1:8787/__bili/?embed=1&lang=zh#/sessions");
     // The backup button keeps the original jump target.
-    const opened: string[] = [];
-    sandbox.open = (url: string) => opened.push(url);
     (buttons[4].props!.onClick as () => void)();
     assert.deepEqual(opened, ["http://127.0.0.1:8787/__bili/"]);
+    m.runCleanups();
 
     // #2125: the bundle panel reuses the probe/frame/hint but drops the title
-    // — the plugin detail page draws it.
-    calls.length = 0;
-    resetHooks();
-    const btree = bundle.component() as ElementNode;
+    // — the plugin detail page draws it. A fresh mount is a fresh page load:
+    // pending first paint again, verdict cache empty again.
+    const bm = await mountClient(extra, "plugins.bundle.config");
+    bm.resetHooks();
+    bm.component();
+    await tick();
+    const btree = bm.component() as ElementNode;
     assert.equal(btree.type, "div");
     assert.equal(findTag(btree, "h3"), undefined, "the bundle panel does not repeat the page title");
     const bframe = findTag(btree, "iframe");
@@ -480,141 +529,34 @@ test("#1590/#2125: client bundle registers the settings.section entry bili AND t
     opened.length = 0;
     (bButtons[bButtons.length - 1].props!.onClick as () => void)();
     assert.deepEqual(opened, ["http://127.0.0.1:8787/__bili/"]);
+    bm.runCleanups();
 
-    delete sandbox.__BILI__;
-    const degraded = runApply();
-    calls.length = 0;
-    resetHooks();
-    const degTree = degraded.bySlot.get("settings.section")!.component() as ElementNode;
-    assert.equal(findButton(degTree), undefined);
-    assert.equal(findTag(degTree, "iframe"), undefined, "no frame before the origin resolves");
-    const degTexts: string[] = [];
-    collectText(degTree, degTexts);
-    assert.ok(degTexts.some((t) => t.includes("/acp")), `degraded hint points at /acp: ${JSON.stringify(degTexts)}`);
-    resetHooks();
-    const degBundleTree = degraded.bySlot.get("plugins.bundle.config")!.component() as ElementNode;
-    assert.equal(findButton(degBundleTree), undefined, "the bundle panel degrades like the settings section");
-    assert.equal(findTag(degBundleTree, "iframe"), undefined, "the bundle panel has no frame while degraded");
-    const degBundleTexts: string[] = [];
-    collectText(degBundleTree, degBundleTexts);
-    assert.ok(degBundleTexts.some((t) => t.includes("/acp")), "the bundle degraded hint points at /acp");
+    // Degraded: no snapshot AND a host without the live route (fetch rejects)
+    // — the entry stays degraded in BOTH slots.
+    for (const slot of ["settings.section", "plugins.bundle.config"]) {
+        const dm = await mountClient({ open: (_url: string) => {}, fetch: async () => { throw new Error("no route"); }, setTimeout, clearTimeout }, slot);
+        dm.resetHooks();
+        const dtree = dm.component() as ElementNode;
+        assert.equal(findButton(dtree), undefined, `${slot}: no buttons while degraded`);
+        assert.equal(findTag(dtree, "iframe"), undefined, `${slot}: no frame before the origin resolves`);
+        const dt: string[] = [];
+        collectText(dtree, dt);
+        assert.ok(dt.some((x) => x.includes("/acp")), `${slot}: degraded hint points at /acp: ${JSON.stringify(dt)}`);
+        dm.runCleanups();
+    }
 });
 
 test("#1809/#2125/#2187: client polls /bili/origin while unresolved — upgrades on success, stays degraded and cancels when absent (both slots); slow phase continues past the fast attempts; #2288 corrects a stale boot snapshot and follows mid-session re-binds", async () => {
-    const { build } = await import("esbuild");
-    const configs = ((await import("../tsup.config.ts")).default) as unknown as Array<{
-        entry: Record<string, string>;
-        platform: string;
-        target: string;
-        external?: string[];
-        banner?: { js?: string };
-        footer?: { js?: string };
-    }>;
-    const cfg = configs.find((c) => c.entry["agent/dsh-native-client"] !== undefined);
-    assert.ok(cfg !== undefined, "tsup config must keep the dsh client entry");
-    const result = await build({
-        entryPoints: [cfg.entry["agent/dsh-native-client"]],
-        bundle: true,
-        format: "cjs",
-        platform: cfg.platform as Parameters<typeof build>[0]["platform"],
-        target: cfg.target,
-        external: cfg.external,
-        banner: cfg.banner,
-        footer: cfg.footer,
-        write: false,
-    });
-    const code = result.outputFiles![0].text;
-
-    type Face = { inject: string[]; apply: (ctx: unknown) => void };
-    const mount = (extra: Record<string, unknown>, slotName = "settings.section"): { component: () => unknown; resetHooks: () => void; runCleanups: () => void } => {
-        const registrations: Array<{ id: string; factory: (require: (spec: string) => unknown) => unknown }> = [];
-        const sandbox: Record<string, unknown> = {};
-        sandbox.window = { __ModuleLoader__: { load: (reg: (typeof registrations)[number]) => registrations.push(reg) } };
-        Object.assign(sandbox, extra);
-        vm.createContext(sandbox);
-        vm.runInContext(code, sandbox, { filename: "dsh-native-client.bundle.js" });
-        assert.equal(registrations.length, 1);
-        const calls: ElementNode[] = [];
-        type EffectSlot = { deps: readonly unknown[] | undefined; cleanup: (() => void) | undefined };
-        let hookStates: unknown[] = [];
-        let hookIndex = 0;
-        let effectSlots: EffectSlot[] = [];
-        const reactStub = {
-            createElement: (type: string, props: Record<string, unknown> | null, ...children: unknown[]): ElementNode => {
-                const el = { type, props, children };
-                calls.push(el);
-                return el;
-            },
-            useState: (init: unknown): [unknown, (v: unknown) => void] => {
-                const i = hookIndex++;
-                if (!(i in hookStates)) hookStates[i] = typeof init === "function" ? (init as () => unknown)() : init;
-                return [hookStates[i], (v: unknown) => { hookStates[i] = v; }];
-            },
-            // React semantics (#2288): run on mount, re-run only on dep change.
-            useEffect: (fn: () => unknown | (() => void), deps?: readonly unknown[]): void => {
-                const i = hookIndex++;
-                const prev = effectSlots[i];
-                const prevDeps = prev?.deps;
-                const unchanged = prevDeps !== undefined && deps !== undefined &&
-                    deps.length === prevDeps.length && deps.every((d, j) => Object.is(d, prevDeps[j]));
-                if (unchanged) return;
-                prev?.cleanup?.();
-                const r = fn();
-                effectSlots[i] = { deps, cleanup: typeof r === "function" ? (r as () => void) : undefined };
-            },
-        };
-        const requireStub = (spec: string): unknown => {
-            if (spec === "react") return reactStub;
-            throw new Error(`unexpected external require: ${spec}`);
-        };
-        const face = registrations[0].factory(requireStub) as Face;
-        const dicts: Record<string, { zh: Record<string, string>; en: Record<string, string> }> = {};
-        const components = new Map<string, () => unknown>();
-        let current: string | undefined;
-        face.apply({
-            effect: (fn: () => void) => fn(),
-            locale: {
-                register: (ns: string, dict: { zh: Record<string, string>; en: Record<string, string> }) => {
-                    dicts[ns] = dict;
-                },
-                bind: (ns: string) => (key: string) => dicts[ns]?.zh?.[key] ?? key,
-            },
-            slots: {
-                inject: (name: string, p: () => void) => {
-                    current = name;
-                    p();
-                },
-                register: (_opts: Record<string, unknown>, comp: () => unknown) => {
-                    components.set(current!, comp);
-                },
-            },
-        });
-        assert.ok(components.has(slotName), `slot ${slotName} must be registered`);
-        const bound = components.get(slotName)!;
-        return {
-            // Hook indices restart on every render (React semantics).
-            component: (): unknown => { hookIndex = 0; return bound(); },
-            resetHooks: () => {
-                hookStates = [];
-                hookIndex = 0;
-                effectSlots = [];
-            },
-            runCleanups: () => {
-                // Positions held by non-effect hooks (useState) stay as holes.
-                for (const slot of effectSlots.splice(0)) slot?.cleanup?.();
-            },
-        };
-    };
-
-    const tick = (): Promise<void> => new Promise<void>((r) => setTimeout(r, 0));
-
+    // #3100: every fetch stub below dispatches on URL — the host origin route
+    // answers JSON, the proxy embed pre-flight answers HTML (htmlOk above).
     {
         const opened: string[] = [];
         const fetched: string[] = [];
-        const m = mount({
+        const m = await mountClient({
             open: (url: string) => opened.push(url),
             fetch: async (url: string) => {
                 fetched.push(url);
+                if (String(url).endsWith("/__bili/?embed=1")) return htmlOk();
                 return { ok: true, json: async () => ({ origin: "http://127.0.0.1:9999" }) };
             },
             setTimeout,
@@ -622,7 +564,9 @@ test("#1809/#2125/#2187: client polls /bili/origin while unresolved — upgrades
         });
         m.resetHooks();
         const first = m.component() as ElementNode;
-        assert.equal(findTag(first, "iframe"), undefined, "first paint before the probe resolves is still degraded");
+        assert.equal(findTag(first, "iframe"), undefined, "#3100: first paint before the pre-flight resolves shows no frame");
+        await tick();
+        m.component();
         await tick();
         const second = m.component() as ElementNode;
         const frame = findTag(second, "iframe");
@@ -634,8 +578,10 @@ test("#1809/#2125/#2187: client polls /bili/origin while unresolved — upgrades
         assert.deepEqual(opened, ["http://127.0.0.1:9999/__bili/"]);
         // #2288: resolution no longer STOPs the probe — exactly one fast probe
         // ran so far; the slow follow-up is still pending and gets cancelled
-        // by runCleanups below.
-        assert.equal(fetched.length, 1, "resolution took exactly the initial fast probe (slow follow-up still pending)");
+        // by runCleanups below. #3100: the embed pre-flight fired exactly once
+        // per distinct origin (in-flight guard dedupes the same-tick re-drives).
+        assert.equal(fetched.filter((u) => u === "/bili/origin").length, 1, "resolution took exactly the initial fast probe (slow follow-up still pending)");
+        assert.equal(fetched.filter((u) => u.endsWith("/__bili/?embed=1")).length, 1, "#3100: one embed pre-flight per distinct origin");
         m.runCleanups();
     }
 
@@ -645,22 +591,21 @@ test("#1809/#2125/#2187: client polls /bili/origin while unresolved — upgrades
         // must be corrected in place by the live route — the old guard froze
         // it for the whole session.
         const opened: string[] = [];
-        const m = mount({
+        const m = await mountClient({
             __BILI__: { origin: "http://127.0.0.1:8787" },
             open: (url: string) => opened.push(url),
-            fetch: async () => ({ ok: true, json: async () => ({ origin: "http://127.0.0.1:18798" }) }),
+            fetch: async (url: string) => {
+                if (String(url).endsWith("/__bili/?embed=1")) return htmlOk();
+                return { ok: true, json: async () => ({ origin: "http://127.0.0.1:18798" }) };
+            },
             setTimeout,
             clearTimeout,
         });
         m.resetHooks();
         const first = m.component() as ElementNode;
-        const firstFrame = findTag(first, "iframe");
-        assert.ok(firstFrame !== undefined, "the snapshot paints immediately (first-paint hint)");
-        assert.equal(
-            firstFrame.props?.src,
-            "http://127.0.0.1:8787/__bili/?embed=1&lang=zh#/overview",
-            "the snapshot binds the frame before the live probe lands",
-        );
+        assert.equal(findTag(first, "iframe"), undefined, "#3100: even a snapshot origin waits for its pre-flight verdict");
+        await tick();
+        m.component();
         await tick();
         const second = m.component() as ElementNode;
         const secondButtons = collectButtons(second);
@@ -696,8 +641,9 @@ test("#1809/#2125/#2187: client polls /bili/origin while unresolved — upgrades
             const i = pending.findIndex((p) => p.id === id);
             if (i >= 0) pending.splice(i, 1);
         }) as unknown as typeof clearTimeout;
-        const m = mount({
-            fetch: async () => {
+        const m = await mountClient({
+            fetch: async (url: string) => {
+                if (String(url).endsWith("/__bili/?embed=1")) return htmlOk();
                 polls += 1;
                 return { ok: true, json: async () => ({ origin: polls < 4 ? "http://127.0.0.1:18798" : "http://127.0.0.1:18800" }) };
             },
@@ -715,6 +661,8 @@ test("#1809/#2125/#2187: client polls /bili/origin while unresolved — upgrades
             t.fn();
         }
         await tick();
+        m.component();
+        await tick();
         const tree = m.component() as ElementNode;
         const treeButtons = collectButtons(tree);
         assert.equal(
@@ -730,7 +678,7 @@ test("#1809/#2125/#2187: client polls /bili/origin while unresolved — upgrades
 
     {
         let cleared = 0;
-        const m = mount({
+        const m = await mountClient({
             fetch: async () => ({ ok: false, json: async () => ({}) }),
             setTimeout,
             clearTimeout: (t: unknown) => {
@@ -752,10 +700,13 @@ test("#1809/#2125/#2187: client polls /bili/origin while unresolved — upgrades
         // #2125: the bundle panel runs the same probe wiring through its own
         // registration.
         const opened: string[] = [];
-        const m = mount(
+        const m = await mountClient(
             {
                 open: (url: string) => opened.push(url),
-                fetch: async () => ({ ok: true, json: async () => ({ origin: "http://127.0.0.1:9999" }) }),
+                fetch: async (url: string) => {
+                    if (String(url).endsWith("/__bili/?embed=1")) return htmlOk();
+                    return { ok: true, json: async () => ({ origin: "http://127.0.0.1:9999" }) };
+                },
                 setTimeout,
                 clearTimeout,
             },
@@ -763,7 +714,9 @@ test("#1809/#2125/#2187: client polls /bili/origin while unresolved — upgrades
         );
         m.resetHooks();
         const first = m.component() as ElementNode;
-        assert.equal(findTag(first, "iframe"), undefined);
+        assert.equal(findTag(first, "iframe"), undefined, "#3100: the bundle panel also waits for the pre-flight");
+        await tick();
+        m.component();
         await tick();
         const second = m.component() as ElementNode;
         const bframe = findTag(second, "iframe");
@@ -794,8 +747,9 @@ test("#1809/#2125/#2187: client polls /bili/origin while unresolved — upgrades
             const i = pending.findIndex((p) => p.id === id);
             if (i >= 0) pending.splice(i, 1);
         }) as unknown as typeof clearTimeout;
-        const m = mount({
-            fetch: async () => {
+        const m = await mountClient({
+            fetch: async (url: string) => {
+                if (String(url).endsWith("/__bili/?embed=1")) return htmlOk();
                 polls += 1;
                 if (polls >= 13) landed = true;
                 return { ok: true, json: async () => ({ origin: polls >= 13 ? "http://127.0.0.1:9997" : null }) };
@@ -805,7 +759,7 @@ test("#1809/#2125/#2187: client polls /bili/origin while unresolved — upgrades
         });
         m.resetHooks();
         const first = m.component() as ElementNode;
-        assert.equal(findTag(first, "iframe"), undefined, "first paint before the probe resolves is still degraded");
+        assert.equal(findTag(first, "iframe"), undefined, "#3100: first paint before the pre-flight resolves shows no frame");
         const delays: number[] = [];
         for (;;) {
             await tick();
@@ -815,6 +769,9 @@ test("#1809/#2125/#2187: client polls /bili/origin while unresolved — upgrades
             delays.push(t.delay);
             t.fn();
         }
+        await tick();
+        m.component();
+        await tick();
         const second = m.component() as ElementNode;
         const sframe = findTag(second, "iframe");
         assert.ok(sframe !== undefined, "a late-arriving origin upgrades the entry without a reload");
@@ -840,7 +797,7 @@ test("#1809/#2125/#2187: client polls /bili/origin while unresolved — upgrades
             const i = pending.findIndex((p) => p.id === id);
             if (i >= 0) pending.splice(i, 1);
         }) as unknown as typeof clearTimeout;
-        const m = mount({
+        const m = await mountClient({
             fetch: async () => ({ ok: true, json: async () => ({ origin: null }) }),
             setTimeout: fakeSetTimeout,
             clearTimeout: fakeClearTimeout,
@@ -863,11 +820,13 @@ test("#1809/#2125/#2187: client polls /bili/origin while unresolved — upgrades
 
     {
         // #2559: the host page's actual ground drives the face's palette.
-        // A dark ground pins &theme=dark ALREADY ON FIRST PAINT (synchronous
-        // sample — fed here through the __BILI__ origin snapshot so no probe
-        // round-trip stands between render and frame) and a light ground pins
-        // &theme=light; unpinned sandboxes (all earlier scenarios) keep the
-        // old exact srcs above, proving a DOM-less host stays OS-driven.
+        // The synchronous sample still classifies on FIRST RENDER (fed here
+        // through the __BILI__ origin snapshot), so the very first frame that
+        // appears already carries &theme=<pin> — #3100 delays that appearance
+        // by at most one loopback pre-flight round-trip, never by a re-sample.
+        // A light ground pins &theme=light; unpinned sandboxes (all earlier
+        // scenarios) keep the old exact srcs above, proving a DOM-less host
+        // stays OS-driven.
         const mkDom = (bg: string): Record<string, unknown> => ({
             __BILI__: { origin: "http://127.0.0.1:9998" },
             document: {
@@ -881,20 +840,28 @@ test("#1809/#2125/#2187: client polls /bili/origin while unresolved — upgrades
             ["rgba(22,27,34,0.98)", "dark"],
             ["rgb(247,248,250)", "light"],
         ] as Array<[string, string]>) {
-            const m = mount({
-                fetch: async () => ({ ok: true, json: async () => ({ origin: "http://127.0.0.1:9998" }) }),
+            const m = await mountClient({
+                fetch: async (url: string) => {
+                    if (String(url).endsWith("/__bili/?embed=1")) return htmlOk();
+                    return { ok: true, json: async () => ({ origin: "http://127.0.0.1:9998" }) };
+                },
                 setTimeout,
                 clearTimeout,
                 ...mkDom(bg),
             });
             m.resetHooks();
             const painted = m.component() as ElementNode;
-            const frame = findTag(painted, "iframe");
-            assert.ok(frame !== undefined, `ground ${bg} still upgrades on first paint`);
+            assert.equal(findTag(painted, "iframe"), undefined, `ground ${bg}: the frame waits for the pre-flight verdict`);
+            await tick();
+            m.component();
+            await tick();
+            const settled = m.component() as ElementNode;
+            const frame = findTag(settled, "iframe");
+            assert.ok(frame !== undefined, `ground ${bg} upgrades once the pre-flight lands`);
             assert.equal(
                 frame.props?.src,
                 `http://127.0.0.1:9998/__bili/?embed=1&lang=zh&theme=${theme}#/overview`,
-                `ground ${bg} classifies ${theme} on the very first paint`,
+                `ground ${bg} classifies ${theme} on first render and carries the pin into the first frame`,
             );
             m.runCleanups();
         }
@@ -962,6 +929,18 @@ test("#2125: the manifest declares no dsh.client.inject (pre-0.2 dsh compat)", (
     assert.equal(pkg.dsh?.client?.inject ?? null, null, "dsh.client.inject would break pre-0.2 dsh clients");
 });
 
+test("#3043: the published manifest exposes ./package.json so dsh's client scanner can locate the package root", () => {
+    const pkg = JSON.parse(fs.readFileSync(new URL("../package.json", import.meta.url), "utf8")) as {
+        exports?: Record<string, unknown>;
+    };
+    // Node's `exports` map is closed once declared — an unlisted subpath throws
+    // ERR_PACKAGE_PATH_NOT_EXPORTED. dsh's client scanner resolves
+    // "<pkg>/package.json" to find the package root before reading dsh.client;
+    // the self-mapping below looks redundant but is load-bearing: drop it and
+    // the scanner swallows the throw, so the browser half never registers.
+    assert.equal(pkg.exports?.["./package.json"], "./package.json");
+});
+
 test("#2448: embed face adapts the data tables to a narrow host panel (CSS pins)", () => {
     // The embed iframe lives inside a dsh settings column (400-760px), not a
     // browser tab — the standalone-page table floors (940px/520px + fixed
@@ -1011,4 +990,118 @@ test("#2473: the web face keeps its canvas coupled to the color scheme", () => {
         mediaIdx !== -1 && declIdx < mediaIdx,
         "color-scheme sits in the base :root (before the dark @media) so both schemes inherit it",
     );
+});
+
+test("#3100: embed pre-flight — a stale proxy build gets the restart notice instead of a 404 frame; transient failures stay pending; verdicts cache per origin", async () => {
+    // The auto-update window: the profile bundle on disk is NEW (this browser
+    // half always runs it) while the long-running proxy child still SERVES the
+    // old build in memory — its /__bili/ route table predates the query form
+    // that landed in v0.1.189 (#2321), so the exact framed URL gets a raw JSON
+    // 404 that used to render inside the iframe.
+    {
+        const opened: string[] = [];
+        const m = await mountClient({
+            open: (url: string) => opened.push(url),
+            fetch: async (url: string) => {
+                if (String(url).endsWith("/__bili/?embed=1")) {
+                    return {
+                        ok: false,
+                        status: 404,
+                        headers: { get: (_k: string) => "application/json; charset=utf-8" },
+                        json: async () => ({ error: { type: "not_found", message: "no such management endpoint" } }),
+                    };
+                }
+                return { ok: true, json: async () => ({ origin: "http://127.0.0.1:18796" }) };
+            },
+            setTimeout,
+            clearTimeout,
+        });
+        m.resetHooks();
+        m.component();
+        await tick();
+        m.component();
+        await tick();
+        const tree = m.component() as ElementNode;
+        assert.equal(findTag(tree, "iframe"), undefined, "#3100: a non-HTML answer must never be framed");
+        const staleText: string[] = [];
+        collectText(tree, staleText);
+        assert.ok(staleText.join(" ").includes("重新启动 dsh"), "the stale notice points at restarting dsh");
+        const btns = collectButtons(tree);
+        assert.equal(btns.length, 1, "the stale face keeps only the backup button");
+        assert.equal(btns[0].props?.title, "http://127.0.0.1:18796", "the backup button still names the live origin");
+        (btns[0].props!.onClick as () => void)();
+        assert.deepEqual(opened, ["http://127.0.0.1:18796/__bili/"], "the backup button targets the bare form every build serves");
+        m.runCleanups();
+    }
+
+    // Transient network errors yield NO verdict: the face stays on the
+    // connecting placeholder (never the restart notice) and each origin-poll
+    // slot re-drives the probe until one lands; the verdict then caches for
+    // the page lifetime (a frozen process cannot gain routes mid-session).
+    {
+        const pending: Array<{ id: number; delay: number; fn: () => void }> = [];
+        let nextId = 1;
+        let embedCalls = 0;
+        const fakeSetTimeout = ((fn: () => void, delay?: number): unknown => {
+            const id = nextId++;
+            pending.push({ id, delay: delay ?? 0, fn });
+            return id;
+        }) as unknown as typeof setTimeout;
+        const fakeClearTimeout = ((id: unknown): void => {
+            const i = pending.findIndex((p) => p.id === id);
+            if (i >= 0) pending.splice(i, 1);
+        }) as unknown as typeof clearTimeout;
+        const m = await mountClient({
+            fetch: async (url: string) => {
+                if (String(url).endsWith("/__bili/?embed=1")) {
+                    embedCalls += 1;
+                    if (embedCalls < 3) throw new Error("network down");
+                    return htmlOk();
+                }
+                return { ok: true, json: async () => ({ origin: "http://127.0.0.1:9999" }) };
+            },
+            setTimeout: fakeSetTimeout,
+            clearTimeout: fakeClearTimeout,
+        });
+        m.resetHooks();
+        const first = m.component() as ElementNode;
+        const preText: string[] = [];
+        collectText(first, preText);
+        assert.ok(preText.join(" ").includes("未绑定 bili 代理"), "before any resolution the entry is still degraded");
+        await tick();
+        const second = m.component() as ElementNode;
+        assert.equal(findTag(second, "iframe"), undefined);
+        const pendText: string[] = [];
+        collectText(second, pendText);
+        assert.ok(pendText.join(" ").includes("正在连接 bili 代理"), "#3100: a failed probe reads as connecting, not as stale");
+        assert.equal(embedCalls, 2, "the resolution and the origin-change effect each probed once; both failed");
+        let upgraded = false;
+        for (let i = 0; i < 5 && !upgraded; i++) {
+            const mid = m.component() as ElementNode;
+            upgraded = findTag(mid, "iframe") !== undefined;
+            if (!upgraded) {
+                const midText: string[] = [];
+                collectText(mid, midText);
+                assert.ok(midText.join(" ").includes("正在连接 bili 代理"), `probe slot ${i + 1}: still down reads as connecting, never stale`);
+                if (pending.length === 0) throw new Error("the origin poll stopped before the probe could retry");
+                const t = pending.shift()!;
+                assert.equal(t.delay, 10000, "post-resolution follow-ups use the slow cadence");
+                t.fn();
+                await tick();
+            }
+        }
+        assert.ok(upgraded, "a recovered probe upgrades the entry without a reload");
+        const settled = m.component() as ElementNode;
+        const frame = findTag(settled, "iframe");
+        assert.ok(frame !== undefined, "the recovered verdict mounts the frame");
+        assert.equal(frame.props?.src, "http://127.0.0.1:9999/__bili/?embed=1&lang=zh#/overview");
+        assert.equal(embedCalls, 3, "probing stops once a verdict lands (slots 1-2 were the failed attempts)");
+        if (pending.length === 0) throw new Error("polling stopped after the verdict");
+        pending.shift()!.fn();
+        await tick();
+        const cached = m.component() as ElementNode;
+        assert.ok(findTag(cached, "iframe") !== undefined, "the frame survives the follow-up tick");
+        assert.equal(embedCalls, 3, "#3100: a cached verdict is never re-fetched");
+        m.runCleanups();
+    }
 });

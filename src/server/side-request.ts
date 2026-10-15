@@ -1,7 +1,7 @@
 import type { WireProtocol } from "../util.js";
 import { estimateRawBodyTokens } from "../preflight.js";
 import { imageTokensInParsedBody } from "../image-tokens.js";
-import { reserveOutputHeadroom, shouldReserveOutputHeadroom } from "../util.js";
+import { reserveOutputHeadroom, shouldReserveOutputHeadroom, systemCarrierTexts } from "../util.js";
 import { type ResolvedImageBilling } from "../image-tokens.js";
 import { ACP_TOOL_NAMES, ABSORB_TOOL_NAME, IMAGE_FULL_TOOL_NAME, RETRIEVE_TOOL_NAME, RULE_TOOL_NAME } from "acp-kernel";
 
@@ -102,28 +102,16 @@ export function isSideRequest(parsed: unknown, requestAgent?: string): boolean {
 // The caller must gate on x-bili-plugin=dsh (evidence-per-client discipline,
 // cf. dshPersonaFingerprintApplies in src/session-id.ts).
 export const DSH_TITLE_SYSTEM_PREFIX = "Create a concise title for an AI coding-assistant session";
+
+// #3149: on the anthropic wire the title prompt rides the TOP-LEVEL `system`
+// field while messages[] holds only the user blob; reading messages[] alone
+// (#2503) let the sidecar claim the raw anchor and fork the real conversation
+// onto a |sub:<fp> ghost. systemCarrierTexts (src/util.ts) reads every wire.
 export function isDshTitleRequest(parsed: unknown): boolean {
     if (!parsed || typeof parsed !== "object") return false;
     const p = parsed as Record<string, unknown>;
     if (Array.isArray(p.tools) && p.tools.length > 0) return false;
-    const msgs = p.messages;
-    if (!Array.isArray(msgs)) return false;
-    for (const m of msgs) {
-        if (!m || typeof m !== "object" || (m as Record<string, unknown>).role !== "system") continue;
-        const c = (m as Record<string, unknown>).content;
-        let text = "";
-        if (typeof c === "string") {
-            text = c;
-        } else if (Array.isArray(c)) {
-            for (const part of c) {
-                if (part && typeof part === "object" && typeof (part as Record<string, unknown>).text === "string") {
-                    text += (part as Record<string, unknown>).text as string;
-                }
-            }
-        }
-        if (text.startsWith(DSH_TITLE_SYSTEM_PREFIX)) return true;
-    }
-    return false;
+    return systemCarrierTexts(p).some((t) => t.startsWith(DSH_TITLE_SYSTEM_PREFIX));
 }
 
 // #2170 measure 1: the two lane gates extracted from src/server.ts so they have

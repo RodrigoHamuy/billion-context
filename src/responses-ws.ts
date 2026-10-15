@@ -3,7 +3,9 @@ import { WebSocket as UpstreamWebSocket, type Dispatcher } from "undici";
 import WebSocket from "ws";
 import { MAX_REQUEST_BYTES, type FetchOptions } from "./fetch-util.js";
 import { withFetchTransport } from "./fetch-transport.js";
-import { connectionNamedHeaders, UPSTREAM_HOP_HEADERS } from "./server/headers.js";
+import { BILI_HOP_HEADER } from "./server/context-window.js";
+import { connectionNamedHeaders, stripRemoteCompactionBetaFeature, UPSTREAM_HOP_HEADERS } from "./server/headers.js";
+import { BILI_TUNNEL_HEADER } from "./tunnel-guard.js";
 import { normalizeSseLineEndings, finalizeSseLineEndings } from "./sse-util.js";
 import type { WsBridgeCodec, WsBridgeContext, WsBridgeSession } from "./ws-bridge.js";
 
@@ -39,13 +41,16 @@ function isAzureOpenAiHost(url: string): boolean {
 }
 
 /** Final wire header set for an upstream Responses WebSocket upgrade: drop
- *  hop-by-hop + sec-websocket- markers, then (azure only) the consumed x-bili-*
+ *  hop-by-hop + sec-websocket- markers, strip codex's own remote-compaction
+ *  beta feature (#3073: parity with the HTTP forward path — probe and turn
+ *  must present the same surface), then (azure only) the consumed x-bili-*
  *  metadata. Exported so the exact egress decision — including the #2359 azure
  *  custom-header-cap strip — is asserted directly rather than via a permissive
  *  round-trip mock. */
 export function finalizeResponsesWsUpstreamHeaders(url: string, rawHeaders: FetchOptions["headers"]): Record<string, string> {
     const headers = Object.fromEntries(new Headers(rawHeaders).entries());
     for (const key of Object.keys(headers)) if (UPSTREAM_HOP_HEADERS.has(key) || key.startsWith("sec-websocket-")) delete headers[key];
+    stripRemoteCompactionBetaFeature(headers);
     if (isAzureOpenAiHost(url)) for (const key of Object.keys(headers)) if (key.startsWith("x-bili-")) delete headers[key];
     return headers;
 }
@@ -128,7 +133,11 @@ export class ResponsesWsHistory {
             if (previous !== this.checkpoint?.id) throw new Error("previous_response_not_found");
             const prior = this.checkpoint;
             if (!prior || !Array.isArray(prior.request.input)) throw new Error("previous_response_not_found");
-            return { ...prior.request, ...request, input: [...prior.request.input, ...prior.output, ...request.input] };
+            // #2966: generate is a per-request action control, not conversation
+            // state — a prewarm's generate:false must not leak into a continuation
+            // that omits the field (the upstream would then refuse to generate).
+            const { generate: _priorGenerate, ...priorRequest } = prior.request;
+            return { ...priorRequest, ...request, input: [...prior.request.input, ...prior.output, ...request.input] };
         }
         return request;
     }
@@ -176,7 +185,7 @@ export class ResponsesWsUpstream {
     private history = new ResponsesWsHistory();
     private active?: { fail: (error: Error, reason?: string) => void };
 
-    constructor(private readonly log: DiagnosticLog = () => {}, private readonly requestBytes = MAX_REQUEST_BYTES) {}
+    constructor(private readonly log: DiagnosticLog = () => {}, private readonly requestBytes = MAX_REQUEST_BYTES, private readonly hopStamp?: string, private readonly forwardTransportFields = false) {}
 
     private resetHistory(reason: string): void {
         this.history.clear();
@@ -194,9 +203,28 @@ export class ResponsesWsUpstream {
     }
 
     private async connect(url: string, options: FetchOptions): Promise<InstanceType<typeof UpstreamWebSocket>> {
-        const headers = finalizeResponsesWsUpstreamHeaders(url, options.headers);
+        // #3073: single egress boundary both request paths share. The prewarm
+        // probe bypasses the ACP pipeline that stamps bili-internal markers on
+        // turn envelopes, so probe and turn handshakes diverged (x-bili-hop /
+        // x-bili-tunnel present only on turns) — different connection keys tore
+        // every client connection onto two upstream sockets and wiped the
+        // checkpoint at the switch. Stamp here, mirroring the pipeline's own
+        // decision: own id only when no upstream bili already marked the
+        // traffic (a present marker means chain-skip — keep it verbatim, like
+        // relay() does), tunnel marker unconditional because this lane IS a
+        // /bili/ absolute-URL forward by construction. Idempotent for turns,
+        // which arrive pre-stamped with exactly these values.
+        const stamped = Object.fromEntries(new Headers(options.headers).entries());
+        if (this.hopStamp !== undefined && !Object.keys(stamped).includes(BILI_HOP_HEADER)) stamped[BILI_HOP_HEADER] = this.hopStamp;
+        stamped[BILI_TUNNEL_HEADER] = "1";
+        const headers = finalizeResponsesWsUpstreamHeaders(url, stamped);
         const wsUrl = url.replace(/^http/, "ws");
-        const key = `${wsUrl}:${canonical(headers)}`;
+        // Connection identity is what the upstream binds to the session. x-bili-*
+        // is consumed at ingress by chained bilis (chain/self-loop detection)
+        // and stripped or ignored by real upstreams — it cannot change how an
+        // upstream treats the connection, so it stays out of the key (#3073):
+        // internal bookkeeping must never fragment the socket.
+        const key = `${wsUrl}:${canonical(Object.fromEntries(Object.entries(headers).filter(([k]) => !k.startsWith("x-bili-"))))}`;
         if (this.key === key && this.socket?.readyState === UpstreamWebSocket.OPEN) return this.socket;
         this.close(this.key !== key ? "connection-key-changed" : "reconnect");
         this.log("debug", "upstream connecting phase=handshake");
@@ -231,7 +259,20 @@ export class ResponsesWsUpstream {
         if (options.method !== "POST" || !new URL(url).pathname.endsWith("/responses") || bodyText === undefined) throw new Error("Unsupported request in Responses WebSocket transport");
         const parsed: unknown = JSON.parse(bodyText);
         if (!object(parsed) || !Array.isArray(parsed.input)) throw new Error("Invalid Responses WebSocket request");
-        const { stream, stream_options: _streamOptions, background: _background, previous_response_id: _previous, type: _type, ...body } = parsed;
+        const { stream, stream_options: streamOptions, background: _background, previous_response_id: _previous, type: _type, ...body } = parsed;
+        // #3063 wire fidelity (WC-017): the codex lane admits stream/stream_options from
+        // the client and must forward them verbatim — real codex create frames always carry
+        // stream:true (required field), and dropping it made chatgpt.com answer with a
+        // zero-output completed turn. Gated on forwardTransportFields (the codec's
+        // allowStreamFlag) rather than field presence: the session layer injects
+        // stream:true into EVERY frame before fetch(), so presence cannot distinguish a
+        // client-sent field from an internal one. The opencode lane (WC-013) refuses both
+        // fields at admission, so its egress stays byte-identical to before.
+        const egressTransportFields: JsonObject = {};
+        if (this.forwardTransportFields) {
+            if (stream !== undefined) egressTransportFields.stream = stream;
+            if (streamOptions !== undefined) egressTransportFields.stream_options = streamOptions;
+        }
         const socket = await this.connect(url, options);
         if (this.active) throw new Error("Responses WebSocket exchange already active");
         const request = this.history.continuation(body);
@@ -295,7 +336,7 @@ export class ResponsesWsUpstream {
                             retryFull = false;
                             this.resetHistory("continuation-rejected");
                             this.log("debug", "upstream retry reason=continuation-rejected action=resend-full");
-                            socket.send(JSON.stringify({ ...body, type: "response.create" }));
+                            socket.send(JSON.stringify({ ...body, ...egressTransportFields, type: "response.create" }));
                             return;
                         }
                         clean();
@@ -347,7 +388,7 @@ export class ResponsesWsUpstream {
             options.signal?.addEventListener("abort", aborted, { once: true });
             if (options.signal?.aborted) aborted();
             else {
-                try { socket.send(JSON.stringify({ ...request, type: "response.create" })); }
+                try { socket.send(JSON.stringify({ ...request, ...egressTransportFields, type: "response.create" })); }
                 catch (error) { fail(error instanceof Error ? error : new Error("Responses WebSocket send failed"), "send-failed"); }
             }
         });
@@ -453,7 +494,7 @@ class ResponsesWsSession implements WsBridgeSession {
     private busy = false;
 
     constructor(private readonly context: WsBridgeContext) {
-        this.transport = new ResponsesWsUpstream(context.log);
+        this.transport = new ResponsesWsUpstream(context.log, undefined, context.instanceId, context.codec.allowStreamFlag === true);
         context.log("info", "Responses socket connected (ACP request pipeline)");
     }
 

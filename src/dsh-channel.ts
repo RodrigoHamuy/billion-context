@@ -179,7 +179,16 @@ export function syncDshProfileManifestSpec(profileDir: string, installedVersion:
     // plugin reconcile. The tmp sits beside the target (same volume ⇒ rename atomic).
     const tmp = `${file}.${process.pid}.tmp`;
     try {
-        fs.writeFileSync(tmp, JSON.stringify(doc, null, 2) + "\n");
+        // fsync before rename (#3157): #2972-M1 made this atomic but a crash
+        // between write and rename still left the host-owned dsh manifest as a
+        // size-correct VDL=0 zero file — same gap, now closed.
+        const fd = fs.openSync(tmp, "w");
+        try {
+            fs.writeFileSync(fd, JSON.stringify(doc, null, 2) + "\n");
+            fs.fsyncSync(fd);
+        } finally {
+            fs.closeSync(fd);
+        }
         fs.renameSync(tmp, file);
     } catch (e) {
         try { fs.rmSync(tmp, { force: true }); } catch { /* best-effort cleanup */ }

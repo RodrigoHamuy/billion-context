@@ -201,8 +201,10 @@ async function withHarness(handler: (raw: string, bodies: string[]) => string, f
         await fn(h);
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 }

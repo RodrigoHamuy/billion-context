@@ -21,8 +21,9 @@ import { defaultConfig } from "acp-kernel";
 import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { dshWorkspaceInstructionsPath, durableMessageToolPaths } from "../src/durable-message-guards.ts";
-// #2989: rig hygiene resets the LIVE session-order registry (the retired
-// persona-anchor ladder is no longer on the production path).
+// #2989: rig hygiene resets the LIVE session-order registry (the persona-
+// anchor ladder is off the production path on every lane since #3134 —
+// v2 order resolution everywhere, google included).
 import { resetSessionOrderForTest } from "../src/session-resolve.ts";
 import { _resetPluginStateForTest } from "../src/plugin.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
@@ -102,8 +103,10 @@ async function startRig(): Promise<Rig> {
 
 async function closeRig(rig: Rig): Promise<void> {
     rig.proxy.close();
+    rig.proxy.closeIdleConnections?.();
     await once(rig.proxy, "close");
     rig.upstream.close();
+    rig.upstream.closeIdleConnections?.();
     await once(rig.upstream, "close");
 }
 
